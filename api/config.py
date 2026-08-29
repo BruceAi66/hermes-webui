@@ -1062,13 +1062,11 @@ MIME_MAP = {
 
 # ── Toolsets (from config.yaml or hardcoded default) ─────────────────────────
 _DEFAULT_TOOLSETS = [
-    "browser",
     "clarify",
     "code_execution",
     "cronjob",
     "delegation",
     "file",
-    "image_gen",
     "memory",
     "session_search",
     "skills",
@@ -9500,6 +9498,41 @@ SESSION_AGENT_CACHE: collections.OrderedDict = collections.OrderedDict()  # LRU 
 # tune it via HERMES_WEBUI_AGENT_CACHE_MAX without editing source.
 SESSION_AGENT_CACHE_MAX = _env_int("HERMES_WEBUI_AGENT_CACHE_MAX", 25)
 SESSION_AGENT_CACHE_LOCK = threading.Lock()
+
+# ── Agent-cache governance (port of gateway agent_cache_pressure, #80764) ─────
+# The LRU cap above bounds the *number* of cached agents; each agent pins a full
+# live transcript (_session_messages) in RAM, so on a long-running WebUI the
+# process still grows without bound as warm sessions churn.  The gateway solved
+# the same problem with three valves (config_defaults.py agent_cache):
+#   1. idle_ttl_secs  — evict agents that have been idle past the TTL;
+#   2. memory_high_mb — soft-evict LRU transcripts when anonymous RSS crosses a
+#                       budget, dropping _session_messages so the heap shrinks
+#                       and the transcript rebuilds from the persisted session
+#                       on the next turn;
+#   3. protect_recent — MRU sessions the pressure pass never touches.
+# WebUI mirrors those with env-tunable defaults identical to the gateway's.
+# 0 disables the valve (parity with gateway semantics where 0/off switches the
+# pass off).  memory_high_mb accepts an MB number or "auto" (derived from the
+# cgroup memory limit, falling back to total RAM).
+_SESSION_AGENT_CACHE_IDLE_TTL_DEFAULT = 3600
+SESSION_AGENT_CACHE_IDLE_TTL = _env_int(
+    "HERMES_WEBUI_AGENT_CACHE_IDLE_TTL",
+    _SESSION_AGENT_CACHE_IDLE_TTL_DEFAULT,
+)
+SESSION_AGENT_CACHE_MEMORY_HIGH_MB = os.getenv(
+    "HERMES_WEBUI_AGENT_CACHE_MEMORY_HIGH_MB", "auto"
+).strip()
+_SESSION_AGENT_CACHE_PROTECT_RECENT_DEFAULT = 8
+SESSION_AGENT_CACHE_PROTECT_RECENT = _env_int(
+    "HERMES_WEBUI_AGENT_CACHE_PROTECT_RECENT",
+    _SESSION_AGENT_CACHE_PROTECT_RECENT_DEFAULT,
+)
+# Seconds between governance passes (idle TTL + memory pressure sweep).
+_SESSION_AGENT_CACHE_GOVERN_INTERVAL_DEFAULT = 60
+SESSION_AGENT_CACHE_GOVERN_INTERVAL = _env_int(
+    "HERMES_WEBUI_AGENT_CACHE_GOVERN_INTERVAL",
+    _SESSION_AGENT_CACHE_GOVERN_INTERVAL_DEFAULT,
+)
 
 
 def _evict_session_agent(session_id: str) -> None:
