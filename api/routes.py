@@ -21935,6 +21935,7 @@ def _handle_cron_recent(handler, parsed):
                         "status": job.get("last_status", "unknown"),
                         "completed_at": ts,
                         "toast_notifications": job.get("toast_notifications") is not False,
+                        "badge_notifications": job.get("badge_notifications") is not False,
                     }
                 )
         latest_session_info = _latest_cron_session_info_for_jobs(
