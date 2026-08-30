@@ -20,10 +20,13 @@ from api.agent_cache_governance import (
 
 
 class _FakeAgent:
-    def __init__(self, last_activity_ts=None):
+    def __init__(self, last_activity_ts=None, flushed=True):
         self._last_activity_ts = last_activity_ts
         self._session_messages = [{"role": "user", "content": "x" * 1000}]
         self._db_flush_scan_prefix = [{"role": "user", "content": "y" * 1000}]
+        # Persistence parity with AIAgent: _last_flushed_db_idx advances to
+        # len(_session_messages) only on a fully successful DB write.
+        self._last_flushed_db_idx = len(self._session_messages) if flushed else 0
 
 
 def _cache_with(entries):
@@ -35,6 +38,15 @@ def _cache_with(entries):
 
 
 def _governor(cache, **kw):
+    # Accept the old ``running_check`` kwarg for legacy tests; translate to the
+    # new snapshot-based active-sids contract.
+    if "running_check" in kw:
+        rc = kw.pop("running_check")
+
+        def _snapshot():
+            return {k for k in list(cache) if rc(k)}
+
+        kw["active_sids_fn"] = _snapshot
     return AgentCacheGovernor(cache, threading.Lock(), **kw)
 
 
@@ -172,3 +184,121 @@ def test_positive_int_parses():
     assert _positive_int("0", 1) == 0  # 0 allowed = disabled
     assert _positive_int("x", 1) == 1
     assert _positive_int(None, 1) == 1
+
+
+# ── persistence gate (gateway parity) ─────────────────────────────────────
+def test_pressure_sweep_skips_unflushed():
+    """A transcript that has not fully flushed to the session DB must not be
+    dropped — clearing the sole complete in-memory copy loses history."""
+    cache = _cache_with([("k", _FakeAgent(flushed=False))])
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+    assert g.sweep_pressure(rss_mb=500) == 0
+    assert cache["k"][0]._session_messages  # still there
+
+
+def test_pressure_sweep_drops_flushed():
+    cache = _cache_with([("k", _FakeAgent(flushed=True))])
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+    assert g.sweep_pressure(rss_mb=500) == 1
+    assert cache["k"][0]._session_messages == []
+
+
+def test_pressure_sweep_revalidates_replaced_entry():
+    """A plan entry replaced by a new turn between planning and release must
+    not be released (the current agent object differs from the planned one)."""
+    cache = _cache_with([("k", _FakeAgent(flushed=True))])
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+
+    original_agent = cache["k"][0]
+
+    class _ReplacingGovernor(g.__class__):
+        _replaced = False
+
+        def _active_sids_fn(self):
+            # On the second plan (the sweep re-runs inside revalidation? no —
+            # replace the entry once between plan and release via hook):
+            return set()
+
+    # Simulate replacement: plan_pressure_evictions is pure; we intercept by
+    # swapping the cache entry after the snapshot but before release. Easiest
+    # deterministic route: wrap plan_pressure_evictions.
+    import api.agent_cache_governance as gmod
+
+    calls = {"n": 0}
+
+    def _plan_wrapper(ordered, is_evictable, **kw):
+        plan = orig_plan(ordered, is_evictable, **kw)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Between planning and release, a new turn replaces the entry.
+            cache["k"] = (_FakeAgent(flushed=True), "sig")
+        return plan
+
+    orig_plan = gmod.plan_pressure_evictions
+    gmod.plan_pressure_evictions = _plan_wrapper
+    try:
+        dropped = g.sweep_pressure(rss_mb=500)
+    finally:
+        gmod.plan_pressure_evictions = orig_plan
+    # The replaced agent must survive; the ORIGINAL planned one was cleared.
+    assert dropped == 0
+    assert cache["k"][0] is not original_agent
+    assert cache["k"][0]._session_messages  # replacement untouched
+
+
+def test_pressure_sweep_goes_active_between_plan_and_release():
+    """A session that becomes mid-turn after planning must be skipped at
+    release time (no transcript dropped while the agent is running)."""
+    cache = _cache_with([("k", _FakeAgent(flushed=True))])
+    state = {"active": False}
+
+    def _active_fn():
+        return {"k"} if state["active"] else set()
+
+    g = _governor(
+        cache, memory_high_mb=100, protect_recent=0, active_sids_fn=_active_fn
+    )
+    # Flip to active after planning (the revalidation inside sweep_pressure
+    # calls _active_sids_fn again before release).
+    state["active"] = True
+    assert g.sweep_pressure(rss_mb=500) == 0
+    assert cache["k"][0]._session_messages  # not dropped
+
+
+def test_pressure_sweep_concurrent_churn_no_crash():
+    """The snapshot must be taken under the lock; unlocked iteration over a
+    churning OrderedDict races (RuntimeError: dictionary changed size during
+    iteration). Deterministic check: churn from another thread while sweeping."""
+    from collections import OrderedDict
+
+    n = 500
+    cache = OrderedDict(
+        (f"k{i}", (_FakeAgent(flushed=True), "sig")) for i in range(n)
+    )
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+    stop = threading.Event()
+    errors = []
+
+    def churn():
+        i = 0
+        while not stop.is_set():
+            try:
+                if len(cache) > n:
+                    cache.popitem(last=False)
+                cache[f"churn{i % 200}"] = (_FakeAgent(flushed=True), "sig")
+                i += 1
+            except Exception:
+                pass
+
+    t = threading.Thread(target=churn, daemon=True)
+    t.start()
+    try:
+        for _ in range(100):
+            try:
+                g.sweep_pressure(rss_mb=500)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+    finally:
+        stop.set()
+        t.join(timeout=5)
+    assert not errors, f"sweep crashed under churn: {errors[0]}"

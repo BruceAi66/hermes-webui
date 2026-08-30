@@ -662,17 +662,6 @@ def main() -> None:
             SESSION_AGENT_CACHE_PROTECT_RECENT, SESSION_AGENT_CACHE_GOVERN_INTERVAL,
         )
 
-        def _governor_running_check(key: str) -> bool:
-            try:
-                from api.config import ACTIVE_RUNS, ACTIVE_RUNS_LOCK
-                with ACTIVE_RUNS_LOCK:
-                    for _entry in (ACTIVE_RUNS or {}).values():
-                        if (_entry or {}).get('session_id') == key:
-                            return True
-            except Exception:
-                pass
-            return False
-
         def _governor_close_agent(key: str, agent) -> None:
             try:
                 from api.streaming import _close_evicted_agent_at_session_boundary
@@ -686,7 +675,6 @@ def main() -> None:
             idle_ttl_secs=SESSION_AGENT_CACHE_IDLE_TTL,
             memory_high_mb=resolve_memory_high_mb(SESSION_AGENT_CACHE_MEMORY_HIGH_MB),
             protect_recent=SESSION_AGENT_CACHE_PROTECT_RECENT,
-            running_check=_governor_running_check,
             close_agent_fn=_governor_close_agent,
             eviction_hook=None,
         )

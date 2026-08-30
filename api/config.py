@@ -1062,11 +1062,13 @@ MIME_MAP = {
 
 # ── Toolsets (from config.yaml or hardcoded default) ─────────────────────────
 _DEFAULT_TOOLSETS = [
+    "browser",
     "clarify",
     "code_execution",
     "cronjob",
     "delegation",
     "file",
+    "image_gen",
     "memory",
     "session_search",
     "skills",

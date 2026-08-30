@@ -261,6 +261,10 @@ def soft_release_transcript(agent: Any) -> None:
     list is safe and is the single biggest lever on resident memory.  Keeps the
     agent object itself so cross-turn state (_user_turn_count, memory-provider
     state) survives the pressure pass.
+
+    Only safe once the transcript is fully on disk: clearing the sole complete
+    in-memory copy while persistence lags loses history on the next rebuild.
+    Callers must check ``transcript_persistence_caught_up(agent)`` first.
     """
     if agent is None:
         return
@@ -279,6 +283,25 @@ def soft_release_transcript(agent: Any) -> None:
         logger.debug("soft-release flush prefix failed", exc_info=True)
 
 
+def transcript_persistence_caught_up(agent: Any) -> bool:
+    """True when the agent's live transcript is fully on disk (gateway parity).
+
+    Mirrors ``gateway/agent_cache_pressure.py::transcript_persistence_caught_up``:
+    ``_last_flushed_db_idx`` is advanced to ``len(messages)`` by
+    ``AIAgent._flush_messages_to_session_db`` only on a fully successful write,
+    so ``flushed >= len(messages)`` means the in-memory list is exactly what the
+    session DB already has.  Unknown shapes are treated as *not* caught up: a
+    skipped eviction costs memory, a wrong one costs the user their conversation.
+    """
+    messages = getattr(agent, "_session_messages", None)
+    if not isinstance(messages, list):
+        return False
+    flushed = getattr(agent, "_last_flushed_db_idx", None)
+    if not isinstance(flushed, int) or isinstance(flushed, bool):
+        return False
+    return flushed >= len(messages)
+
+
 class AgentCacheGovernor:
     """One governance pass: idle TTL eviction + memory-pressure soft eviction.
 
@@ -295,7 +318,7 @@ class AgentCacheGovernor:
         idle_ttl_secs: int = 3600,
         memory_high_mb: Optional[int] = None,
         protect_recent: int = 8,
-        running_check=None,
+        active_sids_fn=None,
         close_agent_fn=None,
         eviction_hook=None,
     ) -> None:
@@ -304,8 +327,9 @@ class AgentCacheGovernor:
         self.idle_ttl_secs = idle_ttl_secs
         self.memory_high_mb = memory_high_mb
         self.protect_recent = protect_recent
-        # running_check(key) → bool: True when the session has a live turn.
-        self._running_check = running_check or (lambda key: False)
+        # active_sids_fn() → set[str]: session_ids with a live agent worker.
+        # Defaults to snapshotting api.config.ACTIVE_RUNS; injectable for tests.
+        self._active_sids_fn = active_sids_fn or self._snapshot_active_sids
         # close_agent_fn(key, agent) → bool: full teardown of an evicted agent
         # (commit memory, close session DB).  Used by the idle-TTL pass.
         self._close_agent_fn = close_agent_fn
@@ -313,6 +337,32 @@ class AgentCacheGovernor:
         self._eviction_hook = eviction_hook
 
     # ── Idle TTL ────────────────────────────────────────────────────────────
+    def _snapshot_active_sids(self) -> set:
+        """Snapshot the set of session_ids with a live agent worker.
+
+        Taken BEFORE the cache lock (parity with the LRU eviction path in
+        api/streaming.py:10422): the codebase never nests ACTIVE_RUNS_LOCK
+        inside SESSION_AGENT_CACHE_LOCK, to avoid a lock-ordering deadlock.
+        A cancel/reconnect can drop STREAMS while the worker is still
+        unwinding, so ACTIVE_RUNS (worker lifecycle) is the authoritative
+        liveness signal — snapshotting it up front is exactly what the
+        existing eviction path does.
+        """
+        active = set()
+        try:
+            from api.config import ACTIVE_RUNS, ACTIVE_RUNS_LOCK
+
+            with ACTIVE_RUNS_LOCK:
+                for _entry in (ACTIVE_RUNS or {}).values():
+                    sid = (_entry or {}).get("session_id")
+                    if sid:
+                        active.add(sid)
+        except Exception:
+            # No liveness registry available — fall back to not evicting
+            # anything mid-turn (conservative: skip, costs memory not history).
+            pass
+        return active
+
     def sweep_idle(self, now: Optional[float] = None) -> int:
         """Fully evict cached agents idle past the TTL (0 = disabled).
 
@@ -323,13 +373,14 @@ class AgentCacheGovernor:
             return 0
         if now is None:
             now = time.time()
+        active = self._active_sids_fn()
         to_evict: List[Tuple[str, Any]] = []
         with self._lock:
             for key, entry in list(self._cache.items()):
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is None:
                     continue
-                if self._running_check(key):
+                if key in active:
                     continue  # mid-turn — don't tear it down
                 last_activity = _agent_last_activity(agent)
                 if last_activity is None:
@@ -358,6 +409,16 @@ class AgentCacheGovernor:
 
         Returns the number of transcripts dropped (0 when memory is fine or the
         pass is disabled).
+
+        Concurrency: the cache snapshot is taken under ``self._lock`` so the
+        plan is built from a consistent view (no dict-mutation RuntimeError
+        while server threads churn the cache).  Each planned soft-release is
+        then re-validated immediately before clearing the transcript: the entry
+        must still exist, still hold the SAME agent object we planned (a turn
+        could have replaced it), the session must not be mid-turn, and the
+        transcript must be fully persisted.  A new turn can start after the
+        plan but before release; skipping the eviction then costs memory, a
+        wrong release costs the user their conversation.
         """
         if not self.memory_high_mb:
             return 0
@@ -366,24 +427,44 @@ class AgentCacheGovernor:
         if rss_mb is None or rss_mb < self.memory_high_mb:
             return 0
 
+        # Snapshot under the lock: the live OrderedDict is mutated by server
+        # threads on every turn, and iterating it unlocked races an insert or
+        # eviction (RuntimeError: dictionary changed size during iteration).
+        with self._lock:
+            snapshot = [
+                (key, entry[0] if isinstance(entry, tuple) and entry else entry)
+                for key, entry in self._cache.items()
+            ]
+
+        active = self._active_sids_fn()
+
         def _is_evictable(key: str, agent: Any) -> bool:
             if agent is None:
                 return False
-            if self._running_check(key):
+            if key in active:
+                return False
+            if not transcript_persistence_caught_up(agent):
                 return False
             return True
 
         plan = plan_pressure_evictions(
-            [
-                (key, entry[0] if isinstance(entry, tuple) and entry else entry)
-                for key, entry in self._cache.items()
-            ],
+            snapshot,
             _is_evictable,
             protect_recent=self.protect_recent,
         )
+        dropped = 0
         for key, agent in plan:
             try:
-                soft_release_transcript(agent)
+                # Revalidate under the lock immediately before release: the
+                # plan can go stale between planning and execution.
+                with self._lock:
+                    entry = self._cache.get(key)
+                    current = entry[0] if isinstance(entry, tuple) and entry else entry
+                    if current is not agent:
+                        continue  # entry replaced since planning — leave it
+                    if key in active or not transcript_persistence_caught_up(agent):
+                        continue  # went active / not persisted — skip
+                    soft_release_transcript(agent)
                 if self._eviction_hook is not None:
                     self._eviction_hook(key, agent, soft=True)
                 logger.info(
@@ -391,9 +472,10 @@ class AgentCacheGovernor:
                     "(rss=%sMB budget=%sMB, cache_size=%d)",
                     key, rss_mb, self.memory_high_mb, len(self._cache),
                 )
+                dropped += 1
             except Exception:
                 logger.debug("pressure soft-evict failed for %s", key, exc_info=True)
-        return len(plan)
+        return dropped
 
     def run_pass(self) -> Dict[str, int]:
         """Run one full governance pass; returns {idle_evicted, pressure_dropped}."""
