@@ -335,9 +335,34 @@ class AgentCacheGovernor:
         self._close_agent_fn = close_agent_fn
         # eviction_hook(key, agent, soft: bool): observability (counters/logs).
         self._eviction_hook = eviction_hook
+        # Plan-time liveness snapshot, kept for lease-less entries (legacy
+        # agents / injected test agents).  Refreshed at the top of each sweep;
+        # None until the first sweep (unknown → fail closed).
+        self._last_active_snapshot: Optional[set] = None
+
+    def _entry_turn_active(self, key: str, agent: Any) -> bool:
+        """True when the cached entry is mid-turn (per-entry lease).
+
+        The streaming layer maintains ``agent._turn_active`` at turn
+        boundaries (api.config.register_active_run / unregister_active_run),
+        so reading it here inside the cache lock yields the NEWEST liveness
+        state — the plan-time snapshot can be stale by the time a release
+        runs.  Entries without a lease (pre-lease agents, injected test
+        agents) fall back to the plan-time snapshot for compatibility.  An
+        unknown liveness (no lease AND no snapshot yet) is treated as ACTIVE:
+        never evict an agent whose liveness we cannot determine (fail closed).
+        An EMPTY snapshot is authoritative — "no one is running" really means
+        the pass may evict.
+        """
+        lease = getattr(agent, "_turn_active", None)
+        if lease is not None:
+            return bool(lease)
+        if self._last_active_snapshot is None:
+            return True  # no snapshot yet — fail closed
+        return key in self._last_active_snapshot
 
     # ── Idle TTL ────────────────────────────────────────────────────────────
-    def _snapshot_active_sids(self) -> set:
+    def _snapshot_active_sids(self) -> Optional[set]:
         """Snapshot the set of session_ids with a live agent worker.
 
         Taken BEFORE the cache lock (parity with the LRU eviction path in
@@ -347,6 +372,12 @@ class AgentCacheGovernor:
         unwinding, so ACTIVE_RUNS (worker lifecycle) is the authoritative
         liveness signal — snapshotting it up front is exactly what the
         existing eviction path does.
+
+        Returns None when the liveness registry is unavailable; callers must
+        skip the pass entirely (fail CLOSED).  Returning an empty set here
+        would mark EVERY agent as inactive and soft-release/evict live
+        workers — the exact "can't determine liveness" case that must never
+        evict.
         """
         active = set()
         try:
@@ -358,9 +389,10 @@ class AgentCacheGovernor:
                     if sid:
                         active.add(sid)
         except Exception:
-            # No liveness registry available — fall back to not evicting
-            # anything mid-turn (conservative: skip, costs memory not history).
-            pass
+            # Liveness registry unavailable — fail CLOSED: skip the pass.
+            # An empty set would read as "no one is running" and evict
+            # mid-turn agents (the empty-set fallback was fail-OPEN).
+            return None
         return active
 
     def sweep_idle(self, now: Optional[float] = None) -> int:
@@ -373,14 +405,20 @@ class AgentCacheGovernor:
             return 0
         if now is None:
             now = time.time()
-        active = self._active_sids_fn()
+        try:
+            active = self._active_sids_fn()
+        except Exception:
+            active = None
+        if active is None:
+            return 0  # liveness registry unavailable — skip the pass (fail closed)
+        self._last_active_snapshot = active
         to_evict: List[Tuple[str, Any]] = []
         with self._lock:
             for key, entry in list(self._cache.items()):
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is None:
                     continue
-                if key in active:
+                if self._entry_turn_active(key, agent):
                     continue  # mid-turn — don't tear it down
                 last_activity = _agent_last_activity(agent)
                 if last_activity is None:
@@ -436,7 +474,13 @@ class AgentCacheGovernor:
                 for key, entry in self._cache.items()
             ]
 
-        active = self._active_sids_fn()
+        try:
+            active = self._active_sids_fn()
+        except Exception:
+            active = None
+        if active is None:
+            return 0  # liveness registry unavailable — skip the pass (fail closed)
+        self._last_active_snapshot = active
 
         def _is_evictable(key: str, agent: Any) -> bool:
             if agent is None:
@@ -456,13 +500,16 @@ class AgentCacheGovernor:
         for key, agent in plan:
             try:
                 # Revalidate under the lock immediately before release: the
-                # plan can go stale between planning and execution.
+                # plan can go stale between planning and execution.  The
+                # mid-turn check here uses the per-entry lease (newest state),
+                # NOT the plan-time snapshot — a turn that started after the
+                # snapshot must stop the release.
                 with self._lock:
                     entry = self._cache.get(key)
                     current = entry[0] if isinstance(entry, tuple) and entry else entry
                     if current is not agent:
                         continue  # entry replaced since planning — leave it
-                    if key in active or not transcript_persistence_caught_up(agent):
+                    if self._entry_turn_active(key, agent) or not transcript_persistence_caught_up(agent):
                         continue  # went active / not persisted — skip
                     soft_release_transcript(agent)
                 if self._eviction_hook is not None:

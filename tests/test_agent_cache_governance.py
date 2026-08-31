@@ -20,13 +20,18 @@ from api.agent_cache_governance import (
 
 
 class _FakeAgent:
-    def __init__(self, last_activity_ts=None, flushed=True):
+    def __init__(self, last_activity_ts=None, flushed=True, turn_active=None):
         self._last_activity_ts = last_activity_ts
         self._session_messages = [{"role": "user", "content": "x" * 1000}]
         self._db_flush_scan_prefix = [{"role": "user", "content": "y" * 1000}]
         # Persistence parity with AIAgent: _last_flushed_db_idx advances to
         # len(_session_messages) only on a fully successful DB write.
         self._last_flushed_db_idx = len(self._session_messages) if flushed else 0
+        # Per-entry turn lease: absent (None) by default so injected agents
+        # exercise the snapshot fallback; tests that simulate a mid-turn
+        # state set it explicitly (streaming.py always initializes it).
+        if turn_active is not None:
+            self._turn_active = turn_active
 
 
 def _cache_with(entries):
@@ -248,21 +253,99 @@ def test_pressure_sweep_revalidates_replaced_entry():
 
 def test_pressure_sweep_goes_active_between_plan_and_release():
     """A session that becomes mid-turn after planning must be skipped at
-    release time (no transcript dropped while the agent is running)."""
-    cache = _cache_with([("k", _FakeAgent(flushed=True))])
-    state = {"active": False}
+    release time (no transcript dropped while the agent is running).
 
-    def _active_fn():
-        return {"k"} if state["active"] else set()
+    This exercises the per-entry lease: the plan-time snapshot is empty (the
+    session looked idle), then the turn starts BETWEEN planning and release.
+    The release-time revalidation reads the agent's lease (newest state) and
+    must skip the soft-release.  The old test flipped the active flag BEFORE
+    calling sweep_pressure, so the single snapshot already saw the session
+    active and no plan was ever built — it could never fail.
+    """
+    cache = _cache_with([("k", _FakeAgent(flushed=True))])
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+
+    import api.agent_cache_governance as gmod
+
+    orig_plan = gmod.plan_pressure_evictions
+    calls = {"n": 0}
+
+    def _plan_wrapper(ordered, is_evictable, **kw):
+        plan = orig_plan(ordered, is_evictable, **kw)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Between planning and release the session goes mid-turn: the
+            # streaming layer sets the lease (register_active_run).  This is
+            # the window the old test never opened.
+            cache["k"][0]._turn_active = True
+        return plan
+
+    gmod.plan_pressure_evictions = _plan_wrapper
+    try:
+        dropped = g.sweep_pressure(rss_mb=500)
+    finally:
+        gmod.plan_pressure_evictions = orig_plan
+    # The plan targeted k, but the release-time lease says mid-turn: skip.
+    assert dropped == 0
+    assert cache["k"][0]._session_messages  # transcript intact
+
+
+def test_pressure_sweep_fail_closed_when_registry_unavailable():
+    """An unavailable liveness registry must skip the pass (fail CLOSED).
+
+    The old empty-set fallback read as 'no one is running' and soft-released
+    EVERY transcript — the exact 'can't determine liveness' case that must
+    never evict.
+    """
+    cache = _cache_with([("k", _FakeAgent(flushed=True))])
+
+    def _broken_fn():
+        raise RuntimeError("registry down")
 
     g = _governor(
-        cache, memory_high_mb=100, protect_recent=0, active_sids_fn=_active_fn
+        cache, memory_high_mb=100, protect_recent=0, active_sids_fn=_broken_fn
     )
-    # Flip to active after planning (the revalidation inside sweep_pressure
-    # calls _active_sids_fn again before release).
-    state["active"] = True
     assert g.sweep_pressure(rss_mb=500) == 0
-    assert cache["k"][0]._session_messages  # not dropped
+    assert cache["k"][0]._session_messages  # nothing dropped
+
+
+def test_idle_sweep_fail_closed_when_registry_unavailable():
+    cache = _cache_with([("k", _FakeAgent(last_activity_ts=time.time() - 7200))])
+
+    def _broken_fn():
+        raise RuntimeError("registry down")
+
+    g = _governor(
+        cache, idle_ttl_secs=3600, active_sids_fn=_broken_fn,
+        close_agent_fn=lambda k, a: None,
+    )
+    assert g.sweep_idle(now=time.time()) == 0
+    assert "k" in cache
+
+
+def test_pressure_sweep_respects_lease_at_release():
+    """The lease (per-entry mid-turn marker) overrides a stale empty plan-time
+    snapshot: a session that went active after planning is never released.
+    """
+    cache = _cache_with([("k", _FakeAgent(flushed=True, turn_active=True))])
+    g = _governor(cache, memory_high_mb=100, protect_recent=0)
+    assert g.sweep_pressure(rss_mb=500) == 0
+    assert cache["k"][0]._session_messages
+
+
+def test_idle_sweep_respects_lease():
+    """Idle sweep must not tear down an agent whose lease says mid-turn, even
+    when the plan-time snapshot missed it."""
+    now = time.time()
+    cache = _cache_with([
+        ("busy", _FakeAgent(last_activity_ts=now - 7200, turn_active=True)),
+        ("stale", _FakeAgent(last_activity_ts=now - 7200)),
+    ])
+    closed = []
+    g = _governor(cache, idle_ttl_secs=3600, close_agent_fn=lambda k, a: closed.append(k))
+    assert g.sweep_idle(now=now) == 1
+    assert closed == ["stale"]
+    assert "busy" in cache
 
 
 def test_pressure_sweep_concurrent_churn_no_crash():
