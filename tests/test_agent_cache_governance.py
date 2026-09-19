@@ -97,6 +97,47 @@ def test_plan_max_evictions():
     assert len(plan) <= 16
 
 
+def test_plan_protect_recent_clamped_to_half_cache():
+    """protect_recent is an upper bound clamped to half the cache (gateway
+    parity), so a cache smaller than protect_recent can never invert the LRU
+    protection window.  With default protect_recent=8:
+
+      cache=1  -> protect 0, 1 candidate    (was: 0 — over-protected)
+      cache=5  -> protect 2, 3 candidates   (was: 2 — inverted window)
+      cache=7  -> protect 3, 4 candidates   (was: 6 — inverted window)
+      cache=8  -> protect 4, 4 candidates   (was: 0 — over-protected)
+      cache=9  -> protect 4, 5 candidates   (was: 1 — over-protected)
+    """
+    # (cache_size, expected_candidate_count) at protect_recent=8
+    expected = {1: 1, 5: 3, 7: 4, 8: 4, 9: 5}
+    for n, want in expected.items():
+        agents = [(f"k{i}", _FakeAgent()) for i in range(n)]
+        plan = plan_pressure_evictions(agents, lambda k, a: True, protect_recent=8)
+        assert len(plan) == want, f"cache={n}: expected {want} candidates, got {len(plan)}"
+
+
+def test_plan_protect_recent_zero_disables_protection():
+    """protect_recent=0 must shed every evictable entry (no protection)."""
+    agents = [(f"k{i}", _FakeAgent()) for i in range(10)]
+    plan = plan_pressure_evictions(agents, lambda k, a: True, protect_recent=0)
+    assert len(plan) == 10
+
+
+def test_plan_protect_recent_negative_treated_as_zero():
+    """A negative protect_recent is clamped to 0 (never a negative slice)."""
+    agents = [(f"k{i}", _FakeAgent()) for i in range(5)]
+    plan = plan_pressure_evictions(agents, lambda k, a: True, protect_recent=-3)
+    assert len(plan) == 5
+
+
+def test_plan_max_evictions_zero_returns_empty():
+    agents = [(f"k{i}", _FakeAgent()) for i in range(10)]
+    plan = plan_pressure_evictions(
+        agents, lambda k, a: True, protect_recent=0, max_evictions=0
+    )
+    assert plan == []
+
+
 # ── soft_release_transcript ───────────────────────────────────────────────
 def test_soft_release_drops_transcript_keeps_agent():
     a = _FakeAgent()

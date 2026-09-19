@@ -39,6 +39,12 @@ _BYTES_PER_MB = 1024 * 1024
 # has room to breathe (parity with gateway.agent_cache_pressure).
 _AUTO_BUDGET_FRACTION = 0.65
 # Below this a "budget" is noise — tiny boxes would evict on every pass.
+# NOTE (intentional WebUI divergence from gateway.agent_cache_pressure.py):
+# the gateway DISABLES the pressure pass (returns None) when the computed
+# auto budget falls below this floor, whereas WebUI RAISES it to the floor.
+# Preserve the existing WebUI contract here (including its regression test)
+# and document the difference explicitly. Operators who want the gateway's
+# disabled behavior can set HERMES_WEBUI_AGENT_CACHE_MEMORY_HIGH_MB=0/off.
 _AUTO_BUDGET_FLOOR_MB = 512
 # Upper bound on soft-evictions per pass, so one pressure burst cannot stall
 # the server tearing down a dozen agents (parity with the gateway).
@@ -234,14 +240,23 @@ def plan_pressure_evictions(
 
     ``ordered`` is the cache's LRU order (oldest first).  ``is_evictable(key,
     agent)`` decides whether a session may be shed (e.g. not mid-turn, live
-    transcript already on disk).  The ``protect_recent`` most-recently-used
-    sessions are never touched — their warm prompt cache is worth the most.
+    transcript already on disk).  ``protect_recent`` is an upper bound,
+    clamped to half the cache: a handful of sessions can be big enough to
+    exhaust the budget on their own (a single tool-heavy transcript runs to
+    hundreds of MB), and a fixed guard would then protect the entire cache
+    and leave the process climbing toward the OOM killer with nothing it is
+    willing to shed (parity with gateway/agent_cache_pressure.py).  The clamp
+    also guarantees the slice endpoint is never negative, so a cache smaller
+    than ``protect_recent`` can no longer invert the LRU protection window.
     """
     plan: List[Tuple[str, Any]] = []
     if not ordered:
         return plan
-    if protect_recent > 0:
-        ordered = ordered[: len(ordered) - protect_recent]
+    if max_evictions <= 0:
+        return plan
+    protect = min(max(protect_recent, 0), len(ordered) // 2)
+    if protect:
+        ordered = ordered[:-protect]
     for key, agent in ordered:
         if len(plan) >= max_evictions:
             break

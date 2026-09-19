@@ -10,6 +10,35 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _start_agent_cache_governor_thread(governor, interval_secs: int):
+    """Start the cache-governor loop, or return None when disabled.
+
+    Zero is the documented disable value.  Keeping the guard here (rather
+    than only at the call site) makes it impossible to accidentally create a
+    daemon that busy-spins through ``time.sleep(0)``.
+    """
+    if interval_secs <= 0:
+        return None
+
+    def _governor_loop():
+        while True:
+            try:
+                governor.run_pass()
+            except Exception as e:
+                print(f'[!!] Agent-cache governance pass failed: {e}', flush=True)
+            time.sleep(interval_secs)
+
+    thread = threading.Thread(
+        target=_governor_loop,
+        name='agent-cache-governor',
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _ignore_sigpipe() -> None:
     """Keep broken client writes from terminating the server process."""
     if (sigpipe := getattr(signal, "SIGPIPE", None)) is not None:
@@ -679,27 +708,21 @@ def main() -> None:
             eviction_hook=None,
         )
 
-        def _governor_loop():
-            while True:
-                try:
-                    _governor.run_pass()
-                except Exception as e:
-                    print(f'[!!] Agent-cache governance pass failed: {e}', flush=True)
-                time.sleep(SESSION_AGENT_CACHE_GOVERN_INTERVAL)
-
-        _governor_thread = threading.Thread(
-            target=_governor_loop,
-            name='agent-cache-governor',
-            daemon=True,
+        # A zero interval means "governance disabled", not "sweep forever":
+        # starting the loop would busy-spin (time.sleep(0)) and pin a CPU core.
+        _governor_thread = _start_agent_cache_governor_thread(
+            _governor, SESSION_AGENT_CACHE_GOVERN_INTERVAL
         )
-        _governor_thread.start()
-        _mem_budget = _governor.memory_high_mb
-        _budget_disp = f'{_mem_budget}MB' if _mem_budget else 'off'
-        print(
-            f'[ok] Agent-cache governor: idle_ttl={SESSION_AGENT_CACHE_IDLE_TTL}s '
-            f'pressure={_budget_disp} protect_recent={SESSION_AGENT_CACHE_PROTECT_RECENT}',
-            flush=True,
-        )
+        if _governor_thread is not None:
+            _mem_budget = _governor.memory_high_mb
+            _budget_disp = f'{_mem_budget}MB' if _mem_budget else 'off'
+            print(
+                f'[ok] Agent-cache governor: idle_ttl={SESSION_AGENT_CACHE_IDLE_TTL}s '
+                f'pressure={_budget_disp} protect_recent={SESSION_AGENT_CACHE_PROTECT_RECENT}',
+                flush=True,
+            )
+        else:
+            print('[ok] Agent-cache governor: disabled (GOVERN_INTERVAL=0)', flush=True)
     except Exception as e:
         print(f'[!!] WARNING: Agent-cache governor failed to start: {e}', flush=True)
 
