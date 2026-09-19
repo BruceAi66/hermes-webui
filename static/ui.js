@@ -6457,7 +6457,18 @@ if(typeof window!=='undefined'){
         return;
       }
       _lastScrollTop=top;
-      if(movedUp){
+      if(movedUp&&bottomDistance>1){
+        // Only a real scroll-away unpins. A collapse ABOVE the tail (worklog
+        // "Done" fold, thinking/tool card collapse, interim-note collapse) shrinks
+        // scrollHeight while the reader is still flush at the tail, so the browser
+        // clamps scrollTop DOWN by the collapsed height and fires a scroll event:
+        // movedUp is true while bottomDistance stays ~0. Reading that as user
+        // intent killed live-follow mid-stream on a reader who never scrolled.
+        // The render-artifact suppression below cannot cover it: it needs a
+        // renderMessages() within the last 1400ms, and the collapse paths above run
+        // from the streaming handlers, which update the DOM incrementally and never
+        // stamp _lastMessageRenderAt. A genuine upward scroll always leaves the true
+        // bottom first, so it still has bottomDistance>1 here.
         _cancelBottomSettle();
         _nearBottomCount=0;
         _scrollPinned=false;
@@ -7763,10 +7774,43 @@ function renderMd(raw){
   });
   s=s.replace(/<strong>([\s\S]*?)<\/strong>/gi,(_,t)=>'**'+t+'**');
   s=s.replace(/<b>([\s\S]*?)<\/b>/gi,(_,t)=>'**'+t+'**');
-  s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>'*'+t+'*');
-  s=s.replace(/<i>([\s\S]*?)<\/i>/gi,(_,t)=>'*'+t+'*');
+  // Keep boundary whitespace OUTSIDE the generated *...* delimiters: the inline
+  // emphasis regex below deliberately rejects a leading/trailing space (so
+  // `a * b * c` is not italicised), and `<em> x </em>` would otherwise degrade
+  // into literal asterisks (or a bullet list at line start).
+  const _emphasis=(t)=>{
+    const m=String(t).match(/^(\s*)([\s\S]*?)(\s*)$/);
+    return (m && m[2]) ? m[1]+'*'+m[2]+'*'+m[3] : t;
+  };
+  s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>_emphasis(t));
+  s=s.replace(/<i>([\s\S]*?)<\/i>/gi,(_,t)=>_emphasis(t));
   s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,t)=>'`'+t+'`');
-  s=s.replace(/<br\s*\/?>/gi,'\n');
+  // Convert <br> to a newline, EXCEPT inside genuine markdown table rows — there a
+  // newline would split the row and destroy the table. No sentinel token is used on
+  // purpose: any fixed placeholder is attacker-suppliable in message text and would be
+  // rewritten on the way out.
+  // The "is this a table row" test must match the DOWNSTREAM table parser's grammar
+  // exactly (a run of pipe-lines whose SECOND line is a separator). A looser per-line
+  // test would treat pipe-wrapped prose like `| note<br># heading |` as a table row and
+  // silently strip its heading/list rendering.
+  {
+    const _rowRe=/^ {0,3}\|.+\|[ \t]*$/;
+    const _sepRe=/^\|[\s|:-]+\|$/;
+    const _lines=s.split('\n');
+    const _isTableRow=new Array(_lines.length).fill(false);
+    for(let i=0;i<_lines.length;){
+      if(!_rowRe.test(_lines[i])){ i++; continue; }
+      let j=i;
+      while(j<_lines.length && _rowRe.test(_lines[j])) j++;
+      // A block qualifies only if the parser would accept it: >=2 rows and a separator
+      // in the second position.
+      if(j-i>=2 && _sepRe.test(_lines[i+1].trim())){
+        for(let k=i;k<j;k++) _isTableRow[k]=true;
+      }
+      i=j;
+    }
+    s=_lines.map((line,i)=>_isTableRow[i]?line:line.replace(/<br\s*\/?>/gi,'\n')).join('\n');
+  }
   // ── Glued-bold-heading lift (issue #1446) ────────────────────────────────
   // LLMs in thinking/reasoning mode frequently emit a "section header" glued
   // to the end of the previous paragraph with no whitespace, like:
@@ -7804,7 +7848,7 @@ function renderMd(raw){
     t=t.replace(/`([^`\n]+)`/g,(_,x)=>{_code_stash.push(`<code>${esc(x)}</code>`);return `\x00C${_code_stash.length-1}\x00`;});
     t=t.replace(/\*\*\*(.+?)\*\*\*/g,(_,x)=>`<strong><em>${esc(x)}</em></strong>`);
     t=t.replace(/\*\*(.+?)\*\*/g,(_,x)=>`<strong>${esc(x)}</strong>`);
-    t=t.replace(/\*([^*\n]+)\*/g,(_,x)=>`<em>${esc(x)}</em>`);
+    t=t.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*/g,(_,x)=>`<em>${esc(x)}</em>`);
     // Strikethrough: ~~text~~ → <del>text</del>
     t=t.replace(/~~(.+?)~~/g,(_,x)=>`<del>${esc(x)}</del>`);
     // #487: Image pass — runs while code stash is active so ![x](url) inside
@@ -7824,7 +7868,7 @@ function renderMd(raw){
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
     // by escaping bare < > that are not part of our own tags
-    const SAFE_INLINE=/^<\/?(strong|em|del|code|a|img)([\s>]|$)/i;
+    const SAFE_INLINE=/^<\/?(strong|em|del|code|a|img|br)([\s>]|$)/i;
     t=t.replace(/<\/?[a-z][^>]*>/gi,tag=>SAFE_INLINE.test(tag)?tag:esc(tag));
     return t;
   }
@@ -7834,7 +7878,7 @@ function renderMd(raw){
   s=s.replace(/(<code\b[^>]*>[\s\S]*?<\/code>)/g,m=>{_ob_stash.push(m);return `\x00O${_ob_stash.length-1}\x00`;});
   s=s.replace(/\*\*\*(.+?)\*\*\*/g,(_,t)=>`<strong><em>${esc(t)}</em></strong>`);
   s=s.replace(/\*\*(.+?)\*\*/g,(_,t)=>`<strong>${esc(t)}</strong>`);
-  s=s.replace(/\*([^*\n]+)\*/g,(_,t)=>`<em>${esc(t)}</em>`);
+  s=s.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*/g,(_,t)=>`<em>${esc(t)}</em>`);
   s=s.replace(/~~(.+?)~~/g,(_,t)=>`<del>${esc(t)}</del>`);
   s=s.replace(/\x00O(\d+)\x00/g,(_,i)=>_ob_stash[+i]);
   s=s.replace(/^###### (.+)$/gm,(_,t)=>`<h6>${inlineMd(t)}</h6>`).replace(/^##### (.+)$/gm,(_,t)=>`<h5>${inlineMd(t)}</h5>`).replace(/^#### (.+)$/gm,(_,t)=>`<h4>${inlineMd(t)}</h4>`).replace(/^### (.+)$/gm,(_,t)=>`<h3>${inlineMd(t)}</h3>`).replace(/^## (.+)$/gm,(_,t)=>`<h2>${inlineMd(t)}</h2>`).replace(/^# (.+)$/gm,(_,t)=>`<h1>${inlineMd(t)}</h1>`);
