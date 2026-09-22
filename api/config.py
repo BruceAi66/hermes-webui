@@ -11192,16 +11192,24 @@ def register_active_run(stream_id: str, **metadata) -> None:
     entry.setdefault("stream_id", stream_id)
     entry.setdefault("started_at", now)
     entry.setdefault("phase", "running")
+    # Per-entry turn lease: the agent-cache governor treats the cached agent's
+    # lease as the authoritative mid-turn signal, so publish the lease BEFORE
+    # the registry row becomes visible.  The governor reads the lease under
+    # SESSION_AGENT_CACHE_LOCK, so a pass landing between the two writes would
+    # otherwise see a registered turn whose lease is still the previous turn's
+    # False, and could idle-evict an agent that has just started its next turn
+    # (the request then misses the cache and rebuilds the agent, losing
+    # cache-resident state such as _user_turn_count).  Lease-first inverts that
+    # window into the safe direction: a lease that reads True a moment early
+    # only delays an eviction by one pass.  Outside ACTIVE_RUNS_LOCK on purpose
+    # — the cache lock is taken briefly here and never at the same time as
+    # ACTIVE_RUNS_LOCK, so no reverse nesting exists (streaming.py deliberately
+    # snapshots ACTIVE_RUNS before taking the cache lock).  The agent may not be
+    # in the cache yet (it is inserted later in the turn); insertion initializes
+    # the lease, see streaming.py.
+    _set_agent_cache_turn_lease(entry.get("session_id"), True)
     with ACTIVE_RUNS_LOCK:
         ACTIVE_RUNS[stream_id] = entry
-    # Per-entry turn lease: the agent-cache governor revalidates mid-turn
-    # state from the cached agent's lease, so keep it in sync with the
-    # registry at the turn boundary.  Outside ACTIVE_RUNS_LOCK on purpose —
-    # the cache lock is taken briefly here and no reverse nesting exists
-    # (streaming.py deliberately snapshots ACTIVE_RUNS before taking the
-    # cache lock).  The agent may not be in the cache yet (it is inserted
-    # later in the turn); insertion initializes the lease, see streaming.py.
-    _set_agent_cache_turn_lease(entry.get("session_id"), True)
 
 
 def update_active_run(stream_id: str, **metadata) -> None:

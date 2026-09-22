@@ -1,7 +1,7 @@
 """Unit tests for api.agent_cache_governance (memory-pressure + idle-TTL valves).
 
-Run: HERMES_WEBUI_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python3.11 \
-     python -m pytest tests/test_agent_cache_governance.py -v
+Run (per AGENTS.md, from the repo root):
+    ./scripts/test.sh tests/test_agent_cache_governance.py
 """
 import sys
 import threading
@@ -425,3 +425,42 @@ def test_pressure_sweep_concurrent_churn_no_crash():
         stop.set()
         t.join(timeout=5)
     assert not errors, f"sweep crashed under churn: {errors[0]}"
+
+
+# ── turn-lease publication order (governor race) ─────────────────────────────
+def test_register_active_run_publishes_lease_before_registry(monkeypatch):
+    """The turn lease must be visible no later than the ACTIVE_RUNS row.
+
+    The governor reads the cached agent's lease under SESSION_AGENT_CACHE_LOCK
+    and treats it as authoritative.  If ``register_active_run`` published the
+    registry row first, a pass landing in that window would see a live turn
+    whose lease still held the previous turn's ``False`` and could idle-evict
+    the agent that just started its next turn — the request then misses the
+    cache and rebuilds the agent, losing cache-resident state such as
+    ``_user_turn_count``.
+    """
+    import api.config as config
+    from collections import OrderedDict
+
+    agent = _FakeAgent(turn_active=False)
+    monkeypatch.setattr(config, "SESSION_AGENT_CACHE", OrderedDict({"s1": (agent, "sig")}))
+
+    lease_at_publish = []
+
+    class _ObservingRuns(dict):
+        def __setitem__(self, key, value):
+            # Snapshot the lease at the exact moment the row becomes visible.
+            lease_at_publish.append(getattr(agent, "_turn_active", None))
+            super().__setitem__(key, value)
+
+    runs = _ObservingRuns()
+    monkeypatch.setattr(config, "ACTIVE_RUNS", runs)
+
+    config.register_active_run("stream-1", session_id="s1")
+
+    assert lease_at_publish == [True], (
+        "the registry row became visible while the lease still read "
+        f"{lease_at_publish}: the governor can idle-evict a just-started turn"
+    )
+    assert runs["stream-1"]["session_id"] == "s1"
+    assert agent._turn_active is True
