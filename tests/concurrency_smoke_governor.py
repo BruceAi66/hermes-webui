@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-"""并发压测:AgentCacheGovernor.sweep_pressure 在缓存 churn 下不崩(冒烟)。
+"""Concurrency smoke: AgentCacheGovernor.sweep_pressure must not crash under cache churn.
 
-复现 Manny7717 的条件:2000 条缓存 + churn 线程(并发 insert/evict) +
-governor 反复跑 sweep_pressure。旧代码会抛
-RuntimeError: dictionary changed size during iteration(异常被吞→压力阀静默失效);
-修复后应稳定跑完,且只释放"非活跃 + 已持久化"的转录。
+Reproduces Manny7717's conditions: 2000 cache entries + a churn thread
+(concurrent insert/evict) + the governor repeatedly running sweep_pressure.
+The old code raised
+RuntimeError: dictionary changed size during iteration (swallowed by the sweep's
+except clause, so the pressure pass silently stopped working);
+after the fix the sweep must complete steadily, releasing only
+"inactive + persisted" transcripts.
+
+Run (per AGENTS.md): from the repo root,
+    ./scripts/test.sh tests/concurrency_smoke_governor.py
+(pytest only imports this module to run main(); the script is not collected by
+pytest.)
 """
 import sys
 import threading
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/root/hermes-webui")
+# Repo root = two levels up from this file; no private machine path hard-coded.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-from api.agent_cache_governance import AgentCacheGovernor, transcript_persistence_caught_up
+from api.agent_cache_governance import AgentCacheGovernor, transcript_persistence_caught_up  # noqa: E402
 
 
 class FakeAgent:
-    """模拟 AIAgent:_session_messages + _last_flushed_db_idx + _db_flush_scan_prefix。"""
+    """Mimic AIAgent: _session_messages + _last_flushed_db_idx + _db_flush_scan_prefix."""
 
     def __init__(self, session_id, flushed=False, activity=0.0):
         self.session_id = session_id
@@ -38,8 +49,8 @@ def main():
 
     gov = AgentCacheGovernor(
         cache, lock,
-        idle_ttl_secs=0,          # 只测压力路径
-        memory_high_mb=1,         # 强制超预算(实际会读 RSS,但传 rss_mb 覆盖)
+        idle_ttl_secs=0,          # pressure path only
+        memory_high_mb=1,         # force over-budget (production code reads RSS; rss_mb overrides)
         protect_recent=0,
     )
 
@@ -51,7 +62,7 @@ def main():
         while not stop.is_set():
             with lock:
                 if len(cache) > n:
-                    # 随机逐出
+                    # evict an arbitrary entry
                     key = next(iter(cache))
                     cache.pop(key, None)
                 cache[f"churn{i % 500}"] = (FakeAgent(f"churn{i % 500}", flushed=True), object())
@@ -66,7 +77,7 @@ def main():
     passes = 300
     for p in range(passes):
         try:
-            dropped = gov.sweep_pressure(rss_mb=2000)  # 强制超预算
+            dropped = gov.sweep_pressure(rss_mb=2000)  # force over-budget
             stats["evicted"] += dropped
         except RuntimeError as e:
             errors.append(f"pass {p}: RuntimeError: {e}")
@@ -82,18 +93,20 @@ def main():
         print(f"FAIL: {len(errors)} errors, first: {errors[0]}")
         sys.exit(1)
 
-    # 校验:被释放的必须是 flushed 的 agent;活跃 agent 不应被释放
+    # Check: released agents must have been flushed; active agents must not be released.
     unflushed_released = 0
     with lock:
         for key, entry in cache.items():
             agent = entry[0] if isinstance(entry, tuple) and entry else entry
             if agent is not None and hasattr(agent, "_session_messages"):
                 if agent._session_messages == [] and agent._last_flushed_db_idx != len([1] * 10) and agent._last_flushed_db_idx < 10:
-                    # 释放后 messages=[];若释放时未 flushed(flushed idx<10)就是 bug
+                    # after release messages=[]; if it was not flushed at release
+                    # time (flushed idx<10) that is a bug
                     unflushed_released += 1
-    # 更简单的校验:释放的 agent 的 _session_messages 应为空,且 persistence 当时 caught up(通过记录)
-    # 这里直接检查:没有任何 agent 同时满足"messages 被清 且 原本未 flushed"
-    # 由于我们无法追溯释放瞬间,改为断言:所有仍在缓存中的 agent,若 messages=[] 则其 flush idx 必须 == 10(flushed)
+    # Simpler check: a released agent's _session_messages must be empty and persistence
+    # must have been caught up at release time. We cannot trace the release moment
+    # afterwards, so instead assert: every agent still in the cache whose messages
+    # are empty must have flush idx == 10 (flushed).
     bad = 0
     with lock:
         for key, entry in cache.items():
