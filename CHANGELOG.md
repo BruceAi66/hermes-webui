@@ -5,6 +5,141 @@
 
 ### Fixed
 
+- **A rejected request no longer poisons the next one on the same connection.** `server.py`
+  is a raw HTTP/1.1 handler where `rfile` is the socket itself, so answering a request
+  before reading its body left those bytes queued. The next request on a keep-alive
+  connection was then parsed starting mid-body, and the client got
+  `400 Bad request syntax ('{"a": "b"}GET /api/health HTTP/1.1')` — an error naming a
+  request it never sent, which is expensive to diagnose from the client side. Every
+  reject path now arms `Connection: close` when a body is still pending, and framing is
+  validated strictly (RFC 9110 `1*DIGIT`, duplicate and comma-combined `Content-Length`
+  reconciled, every `Transfer-Encoding` refused since nothing here decodes one). A
+  genuinely bodyless rejection keeps its keep-alive, so healthy pooled connections are
+  not dropped. Thanks @rodrigogs. (#7550, #6658)
+
+- **Opening a session that belongs to another profile now offers to switch to it instead of
+  looking deleted.** Several cross-profile guards answered `404 Session not found`, which the
+  front-end treats as a missing session and self-heals by clearing the URL and local storage —
+  so a valid deep link into another profile's session destroyed its own way back. Those guards
+  now return the same `409 session_profile_mismatch` the detail-load endpoint has used since
+  #5419, while a genuinely missing session still 404s and still self-heals. The clarify card,
+  compression-recovery card and manual-compression flow were each treating *every* `409` as
+  their own "stale" signal and are now scoped so a cross-profile refusal no longer hides a live
+  prompt or reports a false compression failure. Thanks @happy5318. (#7710, #7714)
+
+- **An OIDC-only or passkey-only deployment no longer shows a dead password prompt.** The
+  `/login` page rendered the password input, submit button and passkey control
+  unconditionally, so an instance with native OIDC configured and no
+  `HERMES_WEBUI_PASSWORD` displayed a password form that silently 401'd every submit. The
+  controls are now gated on the auth methods actually configured, with the passkey button
+  kept for passwordless-passkey instances where it is the only login affordance. Thanks
+  @happy5318. (#7056, #7715)
+
+- **A model whose native id contains a slash no longer poisons its configured-model badge.**
+  The badge builder synthesised a `{provider}/{model}` alias alongside the bare id, so a
+  model already carrying a slash (for example `commandcode` + `deepseek/deepseek-v4-flash`)
+  produced `commandcode/deepseek/deepseek-v4-flash` — a non-functional id that leaked into
+  the badge map, persisted into session state and returned `HTTP 400` from the agent. Only
+  the bare id and the `@provider:model` form are emitted now. Thanks @happy5318. (#7290, #7709)
+
+- **A conversation whose history carries an explicit `null` tool-call list no longer breaks
+  the tool-call summary.** `_extract_tool_calls_from_messages` used `.get('tool_calls', [])`,
+  which returns the default only when the key is *absent* — when a stored message carried the
+  key with a `null` value, the code tried to iterate `None` and raised `TypeError`. Reading
+  such a session now skips the empty entry and still summarises the tool calls that follow it.
+  Thanks @KayZz69. (#7265)
+
+- **The opencode-go provider lists its real models again instead of a frozen snapshot.** Model
+  discovery had fallen back to a hard-coded catalog, so models added or removed upstream never
+  appeared. The provider now queries live, with the lookup scoped to opencode-go alone: a slow
+  or unreachable endpoint falls back to the static catalog rather than blocking the picker for
+  anyone else, older Agent builds that lack the discovery API keep the previous behaviour, and a
+  configured model allowlist still wins over whatever discovery returns. Thanks
+  @shameez-struggles-to-commit. (#7220)
+
+- **Denying a gateway approval now retires the request instead of leaving the run waiting.**
+  When an approval routed through the gateway was denied, the deny reached the agent but the
+  local producer was never retired, so the run could sit waiting on a decision that had already
+  been made. Denial now settles the producer atomically, scoped to the exact
+  `(session_id, run_id, approval_id)` that was answered — sibling approvals from the same run
+  and approvals from other runs are left untouched — and repeated or late responses are bounded
+  no-ops rather than resurrecting a settled request. Thanks @snoyberg. (#7570)
+
+- **The approval card's "Skip all this session" button no longer shows two lightning bolts.**
+  The button rendered its ⚡ twice — once from the icon span in the markup and again from the
+  translated label, which carried its own leading glyph in 14 of 15 locales. The icon now comes
+  only from the markup, matching every sibling button on the card (Allow once / Allow session /
+  Always allow / Deny all pair an icon element with a glyph-free label), and translators no
+  longer carry the symbol in their strings. (#7701)
+
+- **The gateway watcher no longer polls `state.db` around the clock with nobody listening.**
+  Its poll loop re-fingerprinted the gateway state database every few seconds whether or not
+  any SSE client was attached, and slept in 0.1s increments — roughly 10 wakeups a second, all
+  day, on an idle server. The loop now parks on an event when there are no subscribers and is
+  woken by the first one, so an idle instance does no polling work at all; while subscribed it
+  waits on a single timer that still returns immediately on shutdown. Connecting a client
+  remains prompt — the first subscriber unparks the loop rather than waiting out the poll
+  interval. Thanks @DevNexsler. (#7694)
+
+- **A long-running turn no longer replays a stale token count after a reload.** The run-journal
+  recorded live metering frames, so reattaching to a stream — or reloading a tab mid-turn —
+  could replay a snapshot from earlier in the same run and briefly show token/TPS figures that
+  had already been superseded. Metering is now live-only and never journaled, and replayed
+  frames no longer carry an event id that could advance the client's resume cursor past real
+  content. Reattach and reload now show the current numbers for the turn in progress. Thanks
+  @laitekin. (#7291)
+
+- **Steering a conversation works again after the context is compressed.** When compression
+  rotated `agent.session_id`, a steer could no longer find the active worker: it was either
+  silently dropped or accepted and never delivered. Steers now resolve the owning worker
+  directly rather than relying on a cache lookup that compression invalidates, and every
+  terminal exit — normal completion, returned error, raised exception and self-heal — passes
+  through one idempotent settle boundary, so guidance can no longer be stranded between the
+  final drain and teardown. Two related defects are fixed alongside it: **Stop now actually
+  stops** a run that had already passed preflight (previously the worker could consult a
+  removed registry entry, miss the cancellation, and continue to completion), and a live
+  `finalizing` run is no longer reported as `stream_dead`, which had caused the client to tear
+  down its state while the stream was still alive. Compressed sessions from the CLI, TUI,
+  Desktop and ACP now resume correctly, and installations running an older Agent keep their
+  existing sidecar recovery instead of being left unresumable. Thanks @ruizanthony. (#7546)
+
+- **Slash-command autocomplete stops offering commands the WebUI cannot run.** The composer's
+  `/` menu announced all 51 registered commands, but many are CLI-only — picking one produced
+  a command that went nowhere. The menu now announces only the WebUI-dispatchable subset (16),
+  so the difference shows up where it matters: typing a prefix like `/a` or `/re` no longer
+  fills the list with dead options. Filtering is confined to the suggestion list — manually
+  typing a CLI-only command behaves exactly as before, and plugin commands plus the native
+  `/moa`, `/sessions`, `/resume` and `/pet` remain available. Thanks @webtecnica.
+
+- **Concurrent background completions stop burning the async-delegation delivery budget.**
+  When several delegated runs finished at once and idle-woke the same session together, each
+  wakeup consumed a delivery attempt before discovering the others, so the budget could be
+  exhausted and later completions went undelivered. Admission is now an atomic per-origin
+  test-and-set: a second wakeup for an origin already in flight defers without claiming, so it
+  costs zero budget and stays eligible through durable restore. The reservation is released on
+  every exit — claim failure, formatting failure, dispatch failure, and turn completion — so a
+  failed wakeup cannot wedge an origin. Thanks @webtecnica.
+
+- **Images and files produced during Codex commentary are viewable again.** The Agent's OpenAI Codex Responses adapter persists user-visible assistant progress in `codex_message_items` with `phase: "commentary"` while the outer `content` field stays empty. WebUI's session MEDIA authorization and its snapshot capture both read only that outer field, so a `MEDIA:` token emitted during commentary was invisible to both — the artifact was never authorized for the session token and never snapshotted, leaving the user unable to open a file the assistant had just produced. Both consumers now inspect the commentary sidecars as well. The widening is confined to genuinely assistant-authored, correctly-phased items: role, type, phase and content checks all fail closed, so a user-authored message, a tool result or a malformed item cannot grant a path token. Every existing guard is unchanged — exact-path matching, MIME allow-listing, session ownership, profile visibility and the state/secret hard-deny all still run on anything discovered through the new route, and snapshot capture keeps its confinement without double-capturing an artifact already taken from outer content. Verified against the Agent's real producer shape plus an adversarial probe covering user/wrong-role/wrong-phase, denied-state, wrong-path, duplicate, malformed and 300k-item inputs. Thanks @happy5318. (#7654, #7565)
+
+- **Custom model names containing colons are no longer truncated in the picker.** A model id like `ollamacloud/qwen3.5:397b` was cut at its internal colon, so the picker showed a mangled label and two models that differed only after the colon could render identically. The colon is overloaded here — it separates a `@provider:model` routing lane, and it also appears inside perfectly ordinary model names — so the label builder now takes the catalog as the authority for `@custom` entries and leaves a plain-lane model id whole. Labels are display-only: the original option value survives selection and is dispatched unchanged, so no routing behaviour moves. Catalogued, cold, empty, stale, host:port, leading- and trailing-colon and multi-colon names were each checked to stay non-blank and exception-free. Thanks @webtecnica. (#7401, #7240)
+
+- **Context-compaction cards stay visible in long transcripts.** When a transcript grew past the virtualization window, the compaction markers explaining where context was compressed scrolled out of the rendered range and vanished, leaving no indication that compaction had occurred. Pre-window markers are now preserved and placed deterministically, and card placement is stable across repeated renders and window changes — verified to neither lose nor duplicate a card as the virtual window moves. Hardened during review: the settled current-summary card was created only when *no* compaction marker was loaded at all, so a transcript carrying older markers plus a newer summary that none of them referenced silently dropped the summary the session was actually operating under — marker presence is not proof that any marker matches. The fallback now keys on whether a loaded marker actually references the current summary, and participates in the single preserved-task-owner selection so the repair cannot duplicate the task card. Mid-compression, empty-summary, unmatched-anchor-key, first-compaction and matched-marker cases were each checked, and reverting the guard reproduces the original suppression. Thanks @ruizanthony. (#7124)
+
+- **Editing or duplicating a one-shot cron job no longer returns HTTP 500.** The editable schedule field was populated from `schedule_display`, the human-readable label (`once at 2026-08-28 16:00`), and saving submitted that label straight back. The Agent's schedule parser only accepts the canonical timestamp, so it raised — and the route's existing `ValueError` guard did not cover the `update_job()` call, so the failure escaped as a 500. The field now carries the canonical `run_at` for one-shot jobs, and genuinely unparseable input returns a 400 with the parser's message instead of a server error. Natural-language recurring schedules are preserved verbatim: hardening during review found that preferring the canonical cron expression rewrote a job scheduled as `every monday 9am` into `0 9 * * 1` on every edit or duplicate — and because the Agent rebuilds the display string from whatever is submitted, the rewrite stuck and the user silently lost their phrasing. Only the `once at …` label is unparseable, so every other display form is now kept as typed. Thanks @happy5318. (#7649, #7352)
+
+- **"Webhooks" and "Cron Jobs" projects stop appearing on profiles that have none.** `get_cli_sessions(all_profiles=True)` walks every profile's `state.db` in one request, and when the walk reached a profile holding webhook or cron rows it lazily minted the system project — stamping it with the **UI-selected** profile rather than the profile whose rows triggered the mint. So a webhook project from one profile materialized on whichever profile happened to be open, deleting it from `projects.json` did not help because the next sidebar poll re-minted it, and switching profiles produced another copy. Both mint paths now tag the scanned profile. Single-profile calls keep their previous behavior, and no existing project data is overwritten — a pre-existing mis-tagged entry stays until removed, alongside the correctly tagged one. Thanks @carlotestor. (#7630)
+
+- **Multi-frame phone photos stop dragging down session responses.** Multi-Picture Format JPEGs — the multi-frame containers phone cameras routinely produce — were being rejected at the first EOI marker, so they missed the native-image exemption and were handed to the full text-secret scan instead. On a real 30-message payload carrying 12 such images that cost 8.4 s of redaction per response; it is now 0.63 s, with every image byte preserved and non-image output identical. The exemption is granted only after the container fully validates: declared extents must tile the file contiguously to EOF, every secondary JPEG must itself be valid, and malformed offsets, bad counts or sizes, either byte order, overlapping or nested extents, gaps, truncation and undeclared trailing bytes all fail closed back to the normal redaction path rather than being exempted. Parser work is bounded by the APP2 segment size and secondary parsing cannot recurse. Verified against 10 hand-built malformed headers and 20,000 deterministic mutations with no exception raised. Thanks @GeorgeCodes19. (#7641)
+
+- **HTTP access logs survive agent stdout capture.** Agent and tool code replaces or closes `sys.stdout` to capture subprocess output, and the server's per-request access records were being swallowed into that capture instead of reaching the service log — so requests made while a tool was running simply vanished from the log. Access-log records now go through a dedicated writer that owns its own duplicate of the process's original stdout descriptor, taken at import time before any agent code loads, so replacing or closing Python's `sys.stdout` can no longer intercept them. Delivery is proven end to end by a subprocess test that redirects and then closes `sys.stdout` and still observes the records on the real process stdout. Record format, destination and ordering are unchanged for a normal launch, the write is guarded so a broken sink can never break an HTTP response, and `SIGPIPE` is already ignored before serving starts. Thanks @DevNexsler. (#7643, #2684)
+
+- **The session list stops re-resolving the same profile home once per row.** Building the sidebar's session list called `_resolve_profile_home_param()` for every projected row, and each call did a real filesystem resolve of the same path — a production trace pinned 5-17 s of a slow `/api/session` build to that one call site, reached through `Session.__init__` on every sidecar-metadata cache miss. The resolve is now memoized for the duration of a single session-list build via a call-scoped `ContextVar` entered by `_load_cli_sessions_uncached`, so N rows sharing a profile pay one resolve instead of N. Outside that scope the memo is inert, so nothing else in the process can serve a cached path, and the scope is released on exit including on exception — a value resolved under one profile can never be served to another. The active workspace is hoisted the same way, since it returns the same value for every row in a scan. Thanks @totalitarian. (#7636)
+
+- **Server-side speech now honors the TTS engine you configured.** `POST /api/tts` only ever consulted the `engine` field on the request body, so any caller that omitted it — an extension, a native client, a script — silently fell back to Edge regardless of the `tts_engine` saved in Settings. A request that omits `engine` (or sends a whitespace-only value) now inherits the persisted engine, resolved before the provider branches run. An explicit request engine still wins, and a persisted value the server cannot use — `browser`, an extension-only engine, an unknown string, a non-string — still collapses to the historical Edge fallback, because browser speech synthesis has no server-side counterpart. The first-party WebUI callers are unchanged: both now send `engine` explicitly, verified by driving the real production request builders and asserting the outgoing body. Thanks @mvanhorn. (#7394, #7391)
+
+- **Session responses stop redoing the same redaction work on every request.** Redacting a session payload rescanned every string from scratch on each `/api/session` call, including large unchanged transcript bodies that can never contain a secret. Two caches now sit in front of that work: a bounded LRU for large strings and a memoized prefilter that skips values with no candidate pattern, with clean values returned without a copy. Correctness is preserved across runtime policy changes — a plugin calling `register_redaction_patterns()` mid-process invalidates both caches, so a newly registered secret pattern cannot be bypassed by a cached pre-registration result, and the cache is bounded by object size as well as entry count so a single oversized value cannot pin memory. Thanks @ruizanthony. (#7276)
+
 - **Markdown tables survive a `<br>` in a cell, and spaced asterisks stop turning italic.** Models routinely emit `<br>` inside a table cell to stack values on separate lines. `renderMd()` converted every `<br>` to a newline *before* the table parser ran, so the row split in half: the table rendered with a stub first cell and the remaining rows spilled out underneath as raw pipe text. Separately, the inline emphasis rule matched across spaces, so ordinary prose like `2 * 3 * 4 = 24` rendered as `2 <em> 3 </em> 4`. `<br>` is now converted only outside genuine table blocks — classified with the same grammar the table parser itself uses (a run of pipe-lines whose second line is a separator), so pipe-delimited prose such as `| note<br># heading |` keeps its heading and list rendering — and emphasis no longer matches a leading or trailing space. Hardened during review: the first implementation used a fixed internal placeholder that user text could contain (corrupting prose and breaking link anchors), and its stricter emphasis rule silently dropped `<em> spaced </em>`; both are fixed, with the sanitizer still stripping every attribute from a preserved `<br>`. Thanks @JayaMegelar. (#7618)
 - **The Extensions settings pane is localized.** Gallery, Installed and Diagnostics were the last large user-facing surface still rendering hardcoded English. Every visible string in the pane now routes through `t()`, with translations supplied across all 15 shipped locales; each referenced key is present in every locale block, so no string can fall back to a raw key name. Extension names and author-supplied descriptions stay as written — they are third-party metadata, not UI chrome. Thanks @Yularzhi. (#7619, #7581)
 - **`/skills pending` and the other write-approval subcommands reach the agent again.** The WebUI's local `/skills` handler swallowed every argument into its own skill-name search, so the agent-owned write-approval subcommands never reached their handler — `/skills pending`, `/skills approve 3`, `/skills diff` and friends silently ran a name search instead of doing anything. Those subcommands now fall through to the normal send path using the existing opt-out contract that `/reasoning` already uses. Covers every alias the agent handler accepts, including `apply`, `deny` and `drop`, which a first pass missed. Thanks @totalitarian. (#7623)

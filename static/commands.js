@@ -1,3 +1,7 @@
+const _WEBUI_DISPATCHABLE_AGENT_COMMANDS = new Set([
+  'reload-mcp','reload-skills','codex-runtime','credits',
+  'moa','sessions','resume','pet'
+]);
 // ── Slash commands ──────────────────────────────────────────────────────────
 // Built-in commands intercepted before send(). Each command runs locally
 // (no round-trip to the agent) and shows feedback via toast or local message.
@@ -182,6 +186,31 @@ function executeCommand(text){
   return {noEcho:!!cmd.noEcho};
 }
 
+// Agent-registry slash commands that the WebUI actually dispatches when
+// submitted. The autocomplete must not advertise anything outside this set:
+// a non-dispatchable registry command (e.g. /agents) would otherwise fall
+// through send() to the ordinary chat path and trigger an unintended
+// model/API request.
+//
+// This set holds canonical registry names only. getMatchingCommands() matches
+// cmd.name (the canonical metadata name), so alias/underscore forms such as
+// /reload_mcp are covered implicitly: typing one resolves through
+// getAgentCommandMetadata() at dispatch time and the canonical name is what
+// gets tested against the dispatcher allowlist (#6951).
+//
+// Keep this in sync with _AGENT_COMMANDS_RUN_ON_WEBUI in messages.js and
+// _ALLOWED_AGENT_COMMANDS in api/commands.py -- the announced list is a
+// subset of the dispatched list (fail-closed), never a superset.
+// Plugin-category commands are always dispatchable via the plugin exec
+// transport. #6951.
+
+function _isWebuiDispatchableAgentCommand(cmd){
+  const name=String(cmd&&cmd.name||'').trim().toLowerCase();
+  if(_WEBUI_DISPATCHABLE_AGENT_COMMANDS.has(name))return true;
+  // Plugin-registered commands execute via the /api/commands/exec plugin transport.
+  return String(cmd&&cmd.category||'').trim()==='Plugin';
+}
+
 function getMatchingCommands(prefix){
   const q=prefix.toLowerCase();
   const matches=COMMANDS.filter(c=>c.name.startsWith(q)).map(c=>({...c,source:'builtin'}));
@@ -214,9 +243,14 @@ function getMatchingCommands(prefix){
     const name=String(cmd&&cmd.name||'').toLowerCase();
     if(!name.startsWith(q)||seen.has(name))continue;
     if(cmd.cli_only&&name!=='pet')continue;
+    // #6951: only announce commands send() actually dispatches -- anything
+    // else would silently fall through to the normal chat path as plain text.
+    if(!_isWebuiDispatchableAgentCommand(cmd))continue;
     matches.push({
       name,
       desc:String(cmd&&cmd.description||'').trim()||'Agent command',
+      // Surface the registry's argument hint on the autocomplete row (#6951).
+      arg:String(cmd&&cmd.args_hint||'').trim()||undefined,
       source:cmd.category==='Plugin'?'plugin':'agent',
     });
     seen.add(name);
@@ -957,6 +991,12 @@ async function resumeManualCompressionForSession(sid){
     // No active compression job or transient server error — not a real failure.
     // 404: route missed or session gone; 5xx: backend exception during status check.
     if(e&&(!e.status||e.status===404||e.status>=500)) return;
+    // #7710: a cross-profile refusal now arrives as 409
+    // (``session_profile_mismatch``) where it used to be a 404 that hit the
+    // benign early-return above. It is not a compression failure, so do not
+    // render the error state or locally settle the compression UI.
+    if(e&&e.status===409&&typeof _sessionProfileMismatchFromError==='function'
+       &&_sessionProfileMismatchFromError(e)) return;
     if(S.session&&S.session.session_id===sid&&typeof setCompressionUi==='function'){
       const visibleMessages=_manualCompressionVisibleMessages();
       setCompressionUi({

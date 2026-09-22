@@ -1507,6 +1507,44 @@ function editCurrentCron(){
   if (!_currentCronDetail) return;
   openCronEdit(_currentCronDetail);
 }
+function _cronScheduleForEdit(job){
+  // #7352: when the user opens an existing job for edit or duplicate, the
+  // editable field must hold the canonical Agent-parseable schedule, not
+  // the human-readable ``schedule_display`` ("once at ..."). The Agent
+  // parser at cron/jobs.py rejects the display form with ValueError and
+  // the resulting round-trip has been failing with HTTP 500 since the
+  // initial WebUI release.
+  if(!job) return '';
+  const sched = job.schedule;
+  // Only the "once at ..." label is unparseable; every other schedule_display
+  // form the Agent emits (`every monday 9am`, `every 30m`, ...) round-trips
+  // through parse_schedule() AND is what the user actually typed. Prefer it
+  // over the canonical `expr`, otherwise editing or duplicating a
+  // natural-language recurring job silently rewrites it to raw cron
+  // (`every monday 9am` -> `0 9 * * 1`) — the Agent rebuilds schedule_display
+  // from whatever we submit, so the rewrite sticks.
+  const display = job.schedule_display;
+  const displayIsParseable = Boolean(display) && !/^\s*once at\s+/i.test(display);
+  if(sched && typeof sched === 'object'){
+    // One-shot: schedule_display is purely presentation; run_at is what the
+    // parser accepts.
+    if(sched.kind === 'once' && sched.run_at) return sched.run_at;
+    if(displayIsParseable) return display;
+    // Recurring cron: the current Agent schema is ``expr``; some legacy
+    // payloads still expose ``expression`` — accept either.
+    if(sched.expr) return sched.expr;
+    if(sched.expression) return sched.expression;
+    if(sched.run_at) return sched.run_at;
+  }
+  // Final fallback: only use schedule_display if it isn't the "once at ..."
+  // presentation label (which the parser rejects). For any other text
+  // (e.g. interval/every-30m) the display form is also a valid input.
+  if(displayIsParseable){
+    return display;
+  }
+  return '';
+}
+
 function duplicateCurrentCron(){
   if (!_currentCronDetail) return;
   const job = _currentCronDetail;
@@ -1529,7 +1567,7 @@ function duplicateCurrentCron(){
   }
   _renderCronForm({
     name: dupName,
-    schedule: job.schedule_display || (job.schedule && job.schedule.expression) || '',
+    schedule: _cronScheduleForEdit(job),
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
@@ -1590,7 +1628,7 @@ function openCronEdit(job){
   _cronSelectedSkills = Array.isArray(job.skills) ? [...job.skills] : [];
   _renderCronForm({
     name: job.name || '',
-    schedule: job.schedule_display || (job.schedule && job.schedule.expression) || '',
+    schedule: _cronScheduleForEdit(job),
     prompt: job.prompt || '',
     deliver: job.deliver || 'local',
     profile: job.profile || '',
