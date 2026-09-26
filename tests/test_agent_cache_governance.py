@@ -6,7 +6,6 @@ Run: HERMES_WEBUI_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python3.11 \
 import sys
 import threading
 import time
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
