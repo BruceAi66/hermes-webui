@@ -2128,40 +2128,18 @@ async function newSession(flash, options={}){
       if(_dirP&&typeof _dirP.catch==='function') _dirP.catch(()=>{});
     }
     // Refresh sidebar to include the newly created session (#3874).
-    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session')).catch(()=>{})}
+    // force:true -> deferWhileInteracting:false so the new row paints and the
+    // active highlight moves even while the pointer hovers #sessionList. The
+    // handlers used to guarantee this with their own awaited render (#7936);
+    // now that newSession() owns the sole refresh it must force the paint,
+    // matching the project "+" path (#5002: "newSession doesn't render; callers must").
+    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session',{force:true})).catch(()=>{})}
   })();
   try{
     return await _newSessionInFlight;
   }finally{
     _newSessionInFlight=null;
     _setNewSessionPending(false);
-  }
-}
-
-/**
- * Self-heal: clear the stuck session ID from localStorage and URL when a
- * loadSession() call failed during boot (no currentSid). This prevents the
- * browser from retrying the same dead session on every refresh.
- *
- * Called from loadSession() after 401 redirect (undefined data) or any
- * non-404 error (400, 403, 500, network). The 404 path has its own
- * inline self-heal; this helper consolidates the non-404 cases.
- *
- * Only clears when !currentSid — no session is active on screen, so
- * the stored ID is definitely stale. When currentSid is set (already
- * viewing a session), a non-404 failure could be a transient server error
- * and the session may still exist on the server; wiping localStorage in
- * that case is unnecessarily destructive (#4028 follow-up).
- *
- * A click into a *different* dead session (currentSid && currentSid!==sid)
- * must not run it: localStorage and the URL still point at the live session
- * (both are only updated on a successful load), so wiping them would log
- * the user out of a healthy session (#2782).
- */
-function _clearStuckSessionOnBoot(sid, currentSid){
-  if(!currentSid){
-    try{ localStorage.removeItem('hermes-webui-session'); }catch(_){ }
-    try{ history.replaceState(null,'',_appRootPath()); }catch(_){ }
   }
 }
 
@@ -2240,13 +2218,17 @@ async function _switchProfileForSessionLoad(profile){
 }
 
 async function loadSession(sid){
-  const opts = arguments[1] || {};
+  let opts = arguments[1] || {};
+  const requestedSid=sid;
   // Resolve canonical lineage SID BEFORE both the direct and sidebar preload
   // notifications so extensions always see the canonical session id, not the
   // raw sidebar click id (which may differ after lineage folding).
   if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
     const resolvedSid=_resolveSessionIdFromSidebarLineage(sid);
-    if(resolvedSid&&resolvedSid!==sid) sid=resolvedSid;
+    if(resolvedSid&&resolvedSid!==sid){
+      if(!opts._continuationParentSid) opts={...opts,_continuationParentSid:sid};
+      sid=resolvedSid;
+    }
   }
   // Extension pre-open hook — fires once per sidebar click, not on every call.
   // _openSidebarSession passes _preloadNotified:true so the hook isn't re-fired
@@ -2407,6 +2389,7 @@ async function loadSession(sid){
   try {
     data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
+    const metadataErrorStatus=e.status;
     const profileMismatch=_sessionProfileMismatchFromError(e);
     if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
       if (!_isCurrentLoad()) {
@@ -2429,6 +2412,7 @@ async function loadSession(sid){
         return loadSession(sid,{...opts,skipProfileResolve:true,force:true,_preloadNotified:true});
       }catch(switchErr){
         e=switchErr;
+        if(e&&metadataErrorStatus!==undefined) e.status=metadataErrorStatus;
       }
     }
     const _msgInner = $('msgInner');
@@ -2443,36 +2427,49 @@ async function loadSession(sid){
       _rearmActiveSessionStream();
       return;
     }
+    // A continuation retry (including one after a profile switch) still owns
+    // the original parent navigation. If that child is definitively missing,
+    // load the parent once with hint resolution disabled.
+    if(e.status===404&&opts._continuationParentSid){
+      const parentSid=opts._continuationParentSid;
+      _clearSameSessionForceReloadHint(sid);
+      if(_isCurrentLoad()) _loadingSessionId=null;
+      return loadSession(parentSid,{
+        ...opts,
+        _continuationParentSid:null,
+        skipLineageResolve:true,
+        skipContinuationResolve:true,
+        skipProfileResolve:false,
+        force:true,
+        _preloadNotified:true
+      });
+    }
     if(_msgInner){
       if(e.status===404){
         _msgInner.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Session not available in web UI.</div>';
-        // Self-heal (clear saved id + strip /session/<id> URL) only when the
-        // 404'd id is the one we are activating: a boot-time restore
-        // (!currentSid, #2798) or a mid-session reload of the *current* session
-        // whose sidecar was deleted server-side (#2782). A click into a
-        // *different* dead session (currentSid && currentSid!==sid) must not run
-        // it: localStorage and the URL still point at the live session (both are
-        // only updated on a successful load), so wiping them would log the user
-        // out of a healthy session. The URL strip is needed in the self-heal
-        // case because _sessionIdFromLocation() re-injects the id on reload.
-        // Only the rethrow stays gated on !currentSid: boot rethrows to fall
-        // through to empty-state; mid-session there is no boot path to reach.
-        if(!currentSid || currentSid===sid){
-          try{ localStorage.removeItem('hermes-webui-session'); }catch(_){ }
-          try{ history.replaceState(null,'',_appRootPath()); }catch(_){ }
-          if (_isCurrentLoad()) _loadingSessionId = null;
-          if(!currentSid){
-            throw e;
+        // Self-heal only the route/localStorage component that still names the
+        // missing requested ID. A route can override a different valid saved
+        // session during boot, which must remain available for the next load.
+        // The current-load guard above owns this cleanup; each component is
+        // checked independently so unrelated saved or routed sessions survive.
+        try{
+          if(localStorage.getItem('hermes-webui-session')===requestedSid){
+            localStorage.removeItem('hermes-webui-session');
           }
+        }catch(_){ }
+        try{
+          if(typeof _sessionIdFromLocation==='function'&&_sessionIdFromLocation()===requestedSid){
+            history.replaceState(null,'',_appRootPath());
+          }
+        }catch(_){ }
+        if (_isCurrentLoad()) _loadingSessionId = null;
+        if(!currentSid){
+          throw e;
         }
       } else {
-        // Non-404, non-401 failure (400, 403, 500, network): 401 is handled
-        // via the if(!data) guard below since api() returns undefined on 401
-        // rather than throwing. Clear the stuck session ID only during boot
-        // (!currentSid) so the next boot doesn't retry the same dead session.
-        // When currentSid is set, a 500/network error may be transient — the
-        // session might still exist on the server (#4028 follow-up).
-        _clearStuckSessionOnBoot(sid, currentSid);
+        // Non-404, non-401 failures (400, 403, 500, network) do not establish
+        // that the session is gone. Preserve route and localStorage so boot can
+        // retry; 401 returns undefined and is handled below.
         _msgInner.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Failed to load session. Try refreshing or switching sessions.</div>';
         if(typeof showToast==='function') showToast('Failed to load session',3000,'error');
       }
@@ -2533,12 +2530,12 @@ async function loadSession(sid){
   // follow the backend's continuation hint to the visible continuation so a
   // mobile reload mid-compression doesn't strand the user on a hidden snapshot.
   // Do NOT write URL/localStorage here — let the re-entrant loadSession update
-  // them only once the continuation actually loads, so a rejected/deleted/
-  // cross-profile continuation can't poison restore state with an unusable id.
+  // them only once the continuation actually loads. If the hint is definitively
+  // missing, retry this valid parent once without following the hint.
   const continuationSid=(data.session&&data.session.continuation_session_id)||'';
   if(continuationSid&&continuationSid!==sid&&!opts.skipContinuationResolve){
     _loadingSessionId=null;
-    return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
+    return loadSession(continuationSid,{...opts,_continuationParentSid:sid,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
   }
   S.session=data.session;
   if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
@@ -7263,6 +7260,62 @@ function _formatInServerTz(date, options) {
   return adjusted.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
 }
 
+function _isoOffsetMinutes(iso) {
+  // Extract the ±HH:MM / ±HHMM / ±HH offset (in minutes, signed) embedded in
+  // an ISO 8601 timestamp string, e.g. "2026-09-24T09:00:00-07:00" → -420.
+  //
+  // Returns 0 for a trailing "Z" (explicit UTC — the wall clock needs no
+  // shift) and null for a naive string (no offset at all: the zone is
+  // unknown, so the caller must fall back to its own resolver rather than
+  // silently render it as one zone or another).
+  // Also returns null when the string is not a parseable timestamp.
+  if (typeof iso !== 'string' || !iso.trim()) return null;
+  const trimmed = iso.trim();
+  const m = trimmed.match(/([+-])(\d{2}):?(\d{2})(?::?\d{2}(?:\.\d+)?)?$/);
+  if (!m) {
+    if (/Z$/i.test(trimmed)) return 0;
+    return null;
+  }
+  const sign = m[1] === '+' ? 1 : -1;
+  const min = sign * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10));
+  if (!Number.isFinite(min) || Math.abs(min) > 14 * 60) return null;  // no real zone
+  return min;
+}
+
+function _formatInIsoTz(date, options) {
+  // Format `date` in the wall-clock zone its own ISO string carries.
+  //
+  // The agent serialises cron `next_run_at` / `last_run_at` with the
+  // offset of the zone the job was scheduled in (per-profile:
+  // hermes_time._resolve_timezone_name() → the active profile's
+  // config.yaml timezone), e.g. "2026-09-24T09:00:00-07:00" for a job
+  // whose container runs UTC but whose operator configured
+  // America/Los_Angeles. Formatting from the string's own offset is the
+  // only source that is correct for that job — no process-level inference
+  // (HERMES_TIMEZONE / TZ / strftime) and no per-browser guess can know
+  // which profile's zone a given job used.
+  //
+  // Strategy mirrors _formatInServerTz: shift the instant by the string's
+  // offset, then format with timeZone:'UTC' so no further conversion is
+  // applied — the output reads as the wall-clock time in the timestamp's
+  // own zone, including fractional-hour zones (Sao Paulo is whole-hour
+  // but India/Newfoundland are not).
+  //
+  // Returns null when the input carries no usable offset (naive string,
+  // non-string, unparseable), so the caller can fall back to its own
+  // resolver instead of silently rendering the wrong zone.
+  const iso = typeof date === 'string' ? date
+    : (date && typeof date === 'object' && typeof date.iso === 'string') ? date.iso
+    : null;
+  const offsetMin = iso ? _isoOffsetMinutes(iso) : null;
+  if (offsetMin === null || !Number.isFinite(offsetMin)) return null;
+  const instant = new Date(iso.trim());
+  if (Number.isNaN(instant.getTime())) return null;
+  if (offsetMin === 0) return instant.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
+  const adjusted = new Date(instant.getTime() + offsetMin * 60 * 1000);
+  return adjusted.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
+}
+
 function _localDayOrdinal(timestampMs) {
   const date = new Date(timestampMs);
   return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000);
@@ -8134,6 +8187,13 @@ function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
     (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0);
 }
 
+// Nesting under the parent already marks a delegated run, so the nested label drops the
+// agent's "Subagent: " prefix. Display only: rename and search keep _sessionDisplayTitle().
+function _nestedChildTitle(s){
+  const title=_sessionDisplayTitle(s);
+  return _isDelegatedSubagentRow(s)?title.replace(/^Subagent:\s*/i,''):title;
+}
+
 function _isDelegatedSubagentRow(s){
   if(!_isChildSession(s)) return false;
   const role=[s.raw_source,s.source_tag,s.source].map(v=>String(v||'').trim().toLowerCase()).find(Boolean)||'';
@@ -8575,10 +8635,55 @@ function renderSessionListFromCache(){
   const unpinned=orderedSessions.filter(s=>!s.pinned);
   // Date grouping: Pinned / Today / Yesterday / This week / Last week / Older
   const now=_serverNowMs();
-  // Collapse state persisted in localStorage
-  let _groupCollapsed={};
-  try{_groupCollapsed=JSON.parse(localStorage.getItem('hermes-date-groups-collapsed')||'{}');}catch(e){}
-  const _saveCollapsed=()=>{try{localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));}catch(e){}};
+  // Collapse state: in-memory authority, localStorage as best-effort
+  // persistence. If the write fails (quota, blocked storage) the toggle must
+  // still take effect for this session instead of silently reverting (#7953).
+  if(!window.__hermesDateGroupCollapsed) window.__hermesDateGroupCollapsed={};
+  if(!window.__hermesDateGroupPending) window.__hermesDateGroupPending=new Set();
+  const _groupCollapsed=window.__hermesDateGroupCollapsed;
+  const _pending=window.__hermesDateGroupPending;
+  // localStorage is the shared cross-tab authority. A local toggle is only a
+  // PENDING override until its snapshot is successfully written; that write
+  // releases the key so a newer successful choice from another tab wins on
+  // the next read. A failed write keeps the key pending so the local intent
+  // still takes effect for this session (#7953).
+  const _readStoredCollapsed=()=>{
+    // Distinguish a valid snapshot (possibly empty/cleared) from an
+    // unavailable or malformed read: only a valid one may change state.
+    let raw=null;
+    try{ raw=localStorage.getItem('hermes-date-groups-collapsed'); }catch(e){ return null; }
+    if(raw===null||raw==='') return {};
+    // A valid snapshot must be a JSON object. Non-object roots (string,
+    // number, boolean, array) route through the malformed-read fallback:
+    // `k in fresh` in the merge throws on them and kills the render after
+    // the list has already been cleared. Stored `null` is a valid empty
+    // snapshot (everything expanded).
+    try{ const v=JSON.parse(raw); if(v===null) return {}; return (typeof v==='object'&&!Array.isArray(v))?v:null; }catch(e){ return null; }
+  };
+  const _mergeStoredCollapsed=()=>{
+    const fresh=_readStoredCollapsed();
+    if(fresh===null) return; // unavailable/malformed: keep fallback + pending
+    for(const k in fresh){ if(!_pending.has(k)) _groupCollapsed[k]=fresh[k]; }
+    // A valid snapshot (even an empty/cleared one) also removes non-pending
+    // keys it no longer contains; a merge that only adds/updates would keep
+    // stale collapses visible.
+    for(const k in _groupCollapsed){
+      if(!(k in fresh) && !_pending.has(k)) delete _groupCollapsed[k];
+    }
+  };
+  _mergeStoredCollapsed();
+  const _saveCollapsed=()=>{
+    _mergeStoredCollapsed();
+    try{
+      localStorage.setItem('hermes-date-groups-collapsed',JSON.stringify(_groupCollapsed));
+      // The complete intended snapshot is persisted: release the pending
+      // overrides so another tab's newer successful choice can win next read.
+      _pending.clear();
+    }catch(e){
+      // Failed write: keep the keys pending so the local intent survives.
+      if(typeof console!=='undefined'&&console.warn) console.warn('hermes: date-group collapse state could not be persisted', e);
+    }
+  };
   // Group sessions by date
   const groups=[];
   let curLabel=null,curItems=[];
@@ -8671,6 +8776,7 @@ function renderSessionListFromCache(){
       const isCollapsed=body.style.display==='none';
       body.style.display=isCollapsed?'':'none';
       caret.classList.toggle('collapsed',!isCollapsed);
+      _pending.add(g.label);
       _groupCollapsed[g.label]=!isCollapsed;
       _saveCollapsed();
       renderSessionListFromCache();
@@ -8970,7 +9076,7 @@ function renderSessionListFromCache(){
         await _openSidebarSession(childSession, {skipLineageResolve:true});
       };
       const childLabelFor=(child)=>{
-        const childTitle=_sessionDisplayTitle(child)||'Untitled child session';
+        const childTitle=_nestedChildTitle(child)||'Untitled child session';
         const childTime=_formatRelativeSessionTime(_sessionTimestampMs(child));
         const parentNote=child._parent_segment_title?` via ${child._parent_segment_title}`:'';
         return `-> ${childTitle}${parentNote} - ${childTime}`;
