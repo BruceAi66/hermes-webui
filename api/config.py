@@ -12864,24 +12864,30 @@ def register_active_run(stream_id: str, **metadata) -> None:
     entry.setdefault("phase", "running")
     # Per-entry turn lease: the agent-cache governor treats the cached agent's
     # lease as the authoritative mid-turn signal, so publish the lease BEFORE
-    # the registry row becomes visible.  The governor reads the lease under
+    # the registry row becomes visible — and publish BOTH under one
+    # ACTIVE_RUNS_LOCK critical section.  The governor reads the lease under
     # SESSION_AGENT_CACHE_LOCK, so a pass landing between the two writes would
     # otherwise see a registered turn whose lease is still the previous turn's
     # False, and could idle-evict an agent that has just started its next turn
     # (the request then misses the cache and rebuilds the agent, losing
     # cache-resident state such as _user_turn_count).  Lease-first inverts that
-    #    window into the safe direction: a lease that reads True a moment early
-    #    only delays an eviction by one pass.  Written outside ACTIVE_RUNS_LOCK —
-    #    this function needs no registry view, and the brief cache-lock hold
-    #    never nests with the runs lock here.  unregister_active_run DOES take
-    #    the cache lock inside ACTIVE_RUNS_LOCK so its lease write is atomic
-    #    with the still_active recompute; that runs→cache nesting is the safe
-    #    direction (streaming.py deliberately snapshots ACTIVE_RUNS before
-    #    taking the cache lock, so nothing nests the reverse).  The agent may
-    #    not be in the cache yet (it is inserted later in the turn); insertion
-    #    initializes the lease, see streaming.py.
-    _set_agent_cache_turn_lease(entry.get("session_id"), True)
+    # window into the safe direction: a lease that reads True a moment early
+    # only delays an eviction by one pass.
+    #
+    # The lock is what makes the pair atomic with RETIREMENT.  A successor that
+    # wrote its lease and had not yet published its row was invisible to a
+    # finishing stream, whose late False then landed on the successor's live
+    # turn — registry_B=True with lease=False, and the idle governor really
+    # does evict that live agent.  Serialised by the lock, both orders are
+    # correct: a successor that wins the section publishes True + its row
+    # before the finishing stream recomputes, and a finishing stream that wins
+    # sees no successor row and writes False while no successor row exists yet.
+    # The runs→cache nesting is the audited safe direction (streaming.py
+    # snapshots ACTIVE_RUNS before taking the cache lock, and no path nests the
+    # reverse).  The agent may not be in the cache yet (it is inserted later in
+    # the turn); insertion initializes the lease, see streaming.py.
     with ACTIVE_RUNS_LOCK:
+        _set_agent_cache_turn_lease(entry.get("session_id"), True)
         ACTIVE_RUNS[stream_id] = entry
 
 

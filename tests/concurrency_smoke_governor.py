@@ -9,10 +9,9 @@ except clause, so the pressure pass silently stopped working);
 after the fix the sweep must complete steadily, releasing only
 "inactive + persisted" transcripts.
 
-Run (per AGENTS.md): from the repo root,
-    ./scripts/test.sh tests/concurrency_smoke_governor.py
-(pytest only imports this module to run main(); the script is not collected by
-pytest.)
+Run (per AGENTS.md), either form:
+    ./scripts/test.sh tests/concurrency_smoke_governor.py     # pytest collects test_*
+    python tests/concurrency_smoke_governor.py                # standalone, prints stats
 """
 import sys
 import threading
@@ -40,8 +39,12 @@ class FakeAgent:
         return f"<FakeAgent {self.session_id} flushed={self._last_flushed_db_idx == len(self._session_messages)}>"
 
 
-def main():
-    n = 2000
+def run_smoke(passes: int = 300, n: int = 2000) -> dict:
+    """Run the churn smoke; returns {passes, churn_ops, dropped, errors, unpersisted}.
+
+    The cache lock is SHARED with the churn thread — production callers all take
+    it, and a churn writer on a different lock still races the locked snapshot.
+    """
     cache = {}
     for i in range(n):
         cache[f"s{i}"] = (FakeAgent(f"s{i}", flushed=True), object())
@@ -74,7 +77,6 @@ def main():
 
     errors = []
     start = time.time()
-    passes = 300
     for p in range(passes):
         try:
             dropped = gov.sweep_pressure(rss_mb=2000)  # force over-budget
@@ -88,25 +90,10 @@ def main():
     t.join(timeout=5)
     elapsed = time.time() - start
 
-    print(f"passes={passes} churn_ops={stats['churn']} dropped_total={stats['evicted']} elapsed={elapsed:.1f}s")
-    if errors:
-        print(f"FAIL: {len(errors)} errors, first: {errors[0]}")
-        sys.exit(1)
-
-    # Check: released agents must have been flushed; active agents must not be released.
-    unflushed_released = 0
-    with lock:
-        for key, entry in cache.items():
-            agent = entry[0] if isinstance(entry, tuple) and entry else entry
-            if agent is not None and hasattr(agent, "_session_messages"):
-                if agent._session_messages == [] and agent._last_flushed_db_idx != len([1] * 10) and agent._last_flushed_db_idx < 10:
-                    # after release messages=[]; if it was not flushed at release
-                    # time (flushed idx<10) that is a bug
-                    unflushed_released += 1
-    # Simpler check: a released agent's _session_messages must be empty and persistence
-    # must have been caught up at release time. We cannot trace the release moment
-    # afterwards, so instead assert: every agent still in the cache whose messages
-    # are empty must have flush idx == 10 (flushed).
+    # A released agent's _session_messages must be empty AND persistence must
+    # have been caught up at release time. We cannot trace the release moment
+    # afterwards, so instead assert: every agent still in the cache whose
+    # messages are empty must have flush idx == len(messages at release).
     bad = 0
     with lock:
         for key, entry in cache.items():
@@ -114,8 +101,41 @@ def main():
             if agent is not None and getattr(agent, "_session_messages", None) == []:
                 if not transcript_persistence_caught_up(agent):
                     bad += 1
-    if bad:
-        print(f"FAIL: {bad} released agents were NOT persisted at release time")
+
+    return {
+        "passes": passes,
+        "churn_ops": stats["churn"],
+        "dropped": stats["evicted"],
+        "errors": errors,
+        "unpersisted": bad,
+        "elapsed": elapsed,
+    }
+
+
+def test_pressure_sweeps_under_churn_stay_clean():
+    """The documented command must actually exercise the governor.
+
+    A module that only defines main() is collected by pytest without running
+    anything, so the documented smoke command used to pass while checking
+    nothing.  This is the pytest entry point; main() keeps the script form.
+    """
+    result = run_smoke(passes=60, n=400)
+    assert not result["errors"], result["errors"][0]
+    assert result["unpersisted"] == 0, (
+        f"{result['unpersisted']} released agents were NOT persisted at release time"
+    )
+    assert result["dropped"] > 0, "the smoke ran but never released a transcript"
+
+
+def main():
+    result = run_smoke()
+    print(f"passes={result['passes']} churn_ops={result['churn_ops']} "
+          f"dropped_total={result['dropped']} elapsed={result['elapsed']:.1f}s")
+    if result["errors"]:
+        print(f"FAIL: {len(result['errors'])} errors, first: {result['errors'][0]}")
+        sys.exit(1)
+    if result["unpersisted"]:
+        print(f"FAIL: {result['unpersisted']} released agents were NOT persisted at release time")
         sys.exit(1)
 
     print("OK: 300 sweeps under churn, no RuntimeError; all released agents were persisted")

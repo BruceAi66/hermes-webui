@@ -79,6 +79,11 @@ def _cgroup_memory_limit_bytes() -> Optional[int]:
                 (
                     f"/sys/fs/cgroup{own}/memory.high",
                     f"/sys/fs/cgroup{own}/memory.max",
+                    # cgroup v1: the process's own group lives under the v1
+                    # memory-controller mount, not at the unified root.  Without
+                    # this a server in a capped v1 child with an unlimited root
+                    # reads "unlimited" and the pressure pass never fires.
+                    f"/sys/fs/cgroup/memory{own}/memory.limit_in_bytes",
                 )
             )
     except Exception:
@@ -115,22 +120,31 @@ def sys_platform_linux() -> bool:
 
 
 def _own_cgroup_path() -> Optional[str]:
-    """Read the process's own cgroup path (v2: single line; v1: pick memory)."""
+    """Read the process's own cgroup path (v2: single line; v1: pick memory).
+
+    The memory-controller line wins when present: on a v1/hybrid host the first
+    line belongs to an unrelated controller (commonly ``cpuset`` at ``/``), and
+    returning that would point the limit lookup at the unlimited root instead of
+    the capped group this process actually runs in.  Only a unified (v2) line —
+    empty controller field — is used as the fallback.
+    """
     try:
         with open("/proc/self/cgroup", "r", encoding="utf-8") as fh:
+            unified = None
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
                 parts = line.split(":", 2)
-                if len(parts) == 3 and parts[1] == "memory":
+                if len(parts) != 3:
+                    continue
+                if parts[1] == "memory":
                     return parts[2]
-                if len(parts) == 3 and parts[2].startswith("/"):
-                    # v2 single hierarchy: controllers field empty.
-                    return parts[2]
+                if parts[1] == "" and parts[2].startswith("/"):
+                    unified = parts[2]  # v2 single hierarchy: no controller field
+            return unified
     except OSError:
         return None
-    return None
 
 
 def read_anon_rss_mb() -> Optional[int]:
@@ -289,6 +303,39 @@ def _agent_has_resident_transcript(agent: Any) -> bool:
         return False
 
 
+def _captured_transcript(agent: Any) -> Optional[list]:
+    """Snapshot the agent's resident transcript for an explicit commit delivery.
+
+    The release this feeds empties ``_session_messages``; the memory provider
+    must see the messages themselves, because batch-extraction providers skip
+    extraction behind an empty-input guard.  A shallow copy is enough — the
+    provider extracts from the message dicts — and it also stops a successor
+    turn that appends during the commit (which runs outside the cache lock) from
+    moving the list under us.  None means "nothing to deliver": the caller must
+    then not treat the commit as confirmed.
+    """
+    messages = getattr(agent, "_session_messages", None)
+    if not isinstance(messages, list) or not messages:
+        return None
+    return list(messages)
+
+
+def _pending_work_outstanding(session_id: str) -> bool:
+    """True when uncommitted/in-flight memory work still needs the transcript.
+
+    Fail closed: an unreadable lifecycle registry reads as "assume pending", so
+    the release is skipped rather than dropping a transcript that work may still
+    depend on.
+    """
+    try:
+        from api.streaming import _lifecycle_has_uncommitted_work
+
+        return bool(_lifecycle_has_uncommitted_work(session_id))
+    except Exception:
+        logger.debug("pending-work probe failed for %s", session_id, exc_info=True)
+        return True
+
+
 def _commit_pending_memory(session_id: str, agent: Any) -> bool:
     """Commit pending lifecycle memory work BEFORE a pressure release.
 
@@ -296,22 +343,24 @@ def _commit_pending_memory(session_id: str, agent: Any) -> bool:
     shutdown/commit boundary then sees [] and batch-extraction providers
     with empty-input guards skip fact extraction, losing the session's
     memories.  Committing here — with the captured transcript still
-    resident — lets the provider extract from the real messages.
+    resident and delivered explicitly — lets the provider extract from the
+    real messages.
 
     Returns True when the release may proceed (nothing pending, or the
-    commit succeeded); False when pending work could not be committed
-    (in-flight commit elsewhere or provider failure) — the caller must
-    skip the release so the transcript survives for a later commit.
+    commit was delivered, acknowledged, and left nothing newer pending);
+    False when the transcript must be kept — pending work could not be
+    committed (in-flight elsewhere, provider failure, no message-accepting
+    commit hook), the commit was not acknowledged, or a successor registered
+    work during the commit I/O.
     """
+    if not _pending_work_outstanding(session_id):
+        return True
     try:
-        from api.streaming import (
-            _lifecycle_commit_session_memory,
-            _lifecycle_has_uncommitted_work,
-        )
+        from api.streaming import _lifecycle_commit_pending_for_release
 
-        if not _lifecycle_has_uncommitted_work(session_id):
-            return True
-        return _lifecycle_commit_session_memory(session_id, agent=agent, wait=False)
+        return bool(_lifecycle_commit_pending_for_release(
+            session_id, agent, _captured_transcript(agent),
+        ))
     except Exception:
         logger.debug(
             "pending-memory commit before release failed for %s",
@@ -319,6 +368,7 @@ def _commit_pending_memory(session_id: str, agent: Any) -> bool:
             exc_info=True,
         )
         return False
+
 
 
 def soft_release_transcript(agent: Any) -> None:
@@ -601,6 +651,13 @@ class AgentCacheGovernor:
                         continue  # entry replaced during the commit — leave it
                     if self._entry_turn_active(key, agent) or not transcript_persistence_caught_up(agent):
                         continue  # went active / not persisted — skip
+                    if _pending_work_outstanding(key):
+                        # Ownership/generation fence shared with turn
+                        # publication: a successor that started and finished
+                        # while the commit I/O ran has registered work that
+                        # still needs this transcript, and a turn that is
+                        # mid-flight has not registered anything yet.
+                        continue
                     soft_release_transcript(agent)
                 if self._eviction_hook is not None:
                     self._eviction_hook(key, agent, soft=True)

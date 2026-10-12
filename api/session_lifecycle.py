@@ -235,7 +235,42 @@ def _first_uncommitted_segment(entry: dict) -> dict | None:
     return None
 
 
-def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, timeout: float | None = None) -> bool:
+def _deliver_commit_messages(agent, messages, ack_sink: dict | None = None) -> None:
+    """Deliver an explicit transcript to the agent's commit hook.
+
+    ``AIAgent.commit_memory_session(messages=None)`` forwards its argument to
+    the memory provider's ``on_session_end``; a caller that omits it hands the
+    provider ``[]`` and batch-extraction providers with empty-input guards skip
+    extraction entirely.  Passing the captured transcript is what makes the
+    pre-release commit actually extract instead of silently doing nothing.
+
+    ``ack_sink`` (optional) is a dict this function sets ``acknowledged=True``
+    in when the hook returned a truthy value.  The installed agent returns
+    ``None`` and wraps provider I/O in its own swallow-all helper, so real
+    failures (and successes) are invisible from here: a normal return is NOT
+    proof that extraction ran, and only an explicit acknowledgement may
+    authorize clearing a transcript.  A hook that cannot accept the transcript
+    raises TypeError, which the caller turns into a failed commit so the
+    transcript is retained for a later retry.
+    """
+    if messages is None:
+        agent.commit_memory_session()
+        return
+    acknowledged = agent.commit_memory_session(list(messages))
+    if ack_sink is not None and acknowledged:
+        ack_sink["acknowledged"] = True
+
+
+def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, timeout: float | None = None,
+                          messages: list | None = None, ack_sink: dict | None = None) -> bool:
+    """Commit the earliest uncommitted segment for a session.
+
+    ``messages`` is the transcript captured by the caller; when supplied it is
+    delivered to the provider instead of an empty list (see
+    ``_deliver_commit_messages``).  ``ack_sink`` collects whether that delivery
+    was acknowledged — the release path uses it to decide whether the
+    transcript may be cleared.
+    """
     if not session_id:
         return False
     deadline = time.monotonic() + timeout if timeout is not None else None
@@ -272,7 +307,7 @@ def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, ti
         entry["in_flight"] = True
 
     try:
-        effective_agent.commit_memory_session()
+        _deliver_commit_messages(effective_agent, messages, ack_sink)
     except Exception:
         logger.exception("commit_memory_session() failed for session %s", session_id)
         with _condition:
@@ -296,6 +331,43 @@ def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, ti
                 segments[0]["start"] = committed + 1
         _condition.notify_all()
     return True
+
+
+def commit_pending_for_release(session_id: str, agent, messages: list | None) -> bool:
+    """Commit pending memory work before a caller clears a session's transcript.
+
+    Used by the agent-cache pressure governor, which is about to empty
+    ``agent._session_messages``.  The transcript must not be dropped while work
+    that depends on it is uncommitted, and the commit must see the messages
+    themselves (providers with empty-input guards skip extraction otherwise).
+
+    Returns True only when the release is safe:
+
+    * nothing is pending — the transcript is free to drop;
+    * or the commit ran with the explicit captured transcript, the agent
+      acknowledged the delivery, and nothing newer (including work registered by
+      a successor stream during the commit I/O) still depends on it.
+
+    A False return means "keep the transcript": a skipped release costs memory,
+    a wrong one costs the user their memories.  Note the residual limitation on
+    the installed agent: ``AIAgent.commit_memory_session()`` returns None and
+    swallows provider exceptions inside its own teardown helper, so it can never
+    acknowledge — the transcript is retained for a later pass rather than
+    treated as extracted.
+    """
+    if not session_id:
+        return False
+    if not has_uncommitted_work(session_id):
+        return True
+    ack: dict = {"acknowledged": False}
+    if not commit_session_memory(session_id, agent=agent, wait=False,
+                                 messages=messages, ack_sink=ack):
+        return False  # in-flight elsewhere, raised, or no owner to commit with
+    if has_uncommitted_work(session_id):
+        # A successor registered (or completed) work while the commit I/O ran
+        # outside the cache lock; that work still needs this transcript.
+        return False
+    return bool(ack.get("acknowledged"))
 
 
 def drain_all_on_shutdown(deadline: float = 30.0) -> None:
