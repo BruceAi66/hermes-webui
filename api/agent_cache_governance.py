@@ -304,16 +304,25 @@ def _agent_has_resident_transcript(agent: Any) -> bool:
 
 
 def _pending_work_outstanding(session_id: str) -> bool:
-    """True when uncommitted/in-flight memory work still needs the transcript.
+    """True when memory work still needs the transcript.
+
+    That is uncommitted/in-flight work OR an unacknowledged release debt: the
+    debt is latched outside ``committed_generation``, so an ordinary commit (the
+    New Chat background worker, a boundary drain) can make the session look
+    clean while the release gate's refusal still stands.  Consulting only
+    ``has_uncommitted_work`` here would let the next pass clear a transcript no
+    extraction confirmed.
 
     Fail closed: an unreadable lifecycle registry reads as "assume pending", so
     the release is skipped rather than dropping a transcript that work may still
     depend on.
     """
     try:
-        from api.streaming import _lifecycle_has_uncommitted_work
+        from api.streaming import _lifecycle_has_release_debt, _lifecycle_has_uncommitted_work
 
-        return bool(_lifecycle_has_uncommitted_work(session_id))
+        return bool(_lifecycle_has_uncommitted_work(session_id)) or bool(
+            _lifecycle_has_release_debt(session_id)
+        )
     except Exception:
         logger.debug("pending-work probe failed for %s", session_id, exc_info=True)
         return True

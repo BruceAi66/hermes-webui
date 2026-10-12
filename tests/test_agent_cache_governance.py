@@ -1174,6 +1174,116 @@ def test_pressure_never_releases_an_unacknowledged_commit_across_passes():
     assert len(agent.commits) == 3, "each pass must retry the delivery"
 
 
+def test_pressure_refusal_survives_a_new_chat_background_commit():
+    """Mixed schedule: pressure refusal → New Chat background commit → pressure.
+
+    ``POST /api/session/new`` fire-and-forgets an ORDINARY
+    ``commit_session_memory()`` for ``prev_session_id`` (api/routes.py).  That
+    call cannot acknowledge, so it must not erase the obligation the release
+    gate refused: it used to advance/remove the same dirty generation, after
+    which the next pass read "nothing pending" and cleared the transcript with
+    no extraction attempt (the re-gate measured ``drops=[0,1]`` over this exact
+    composition).  Reproduced here with both installed-shaped agents.
+    """
+    from api.session_lifecycle import _reset_for_tests, commit_session_memory
+
+    for build, label in ((_RecordingCommitAgent, "success-None"),
+                         (_SwallowingCommitAgent, "swallowed-failure-None")):
+        _reset_for_tests()
+        agent = build(flushed=True)
+        cache = _cache_with([("k0", agent)])
+        _pending_session("k0", agent)
+
+        g = _governor(cache, memory_high_mb=100, protect_recent=0,
+                      running_check=lambda k: False)
+        first = g.sweep_pressure(rss_mb=500)
+
+        # The real New Chat handler's fire-and-forget commit (no acknowledgement).
+        commit_session_memory("k0", agent=agent)
+
+        second = g.sweep_pressure(rss_mb=500)
+
+        # The discriminator: the second pass must not clear a transcript no
+        # extraction confirmed (this read [0, 1] on the previous head).
+        assert [first, second] == [0, 0], (
+            f"{label}: an ordinary commit authorised the second release ({[first, second]})"
+        )
+        assert agent._session_messages, label
+
+        # ...and the reason it held is the latched obligation.
+        from api.session_lifecycle import has_release_debt, has_uncommitted_work
+
+        assert has_uncommitted_work("k0") is False, f"{label}: the ordinary commit advanced the work"
+        assert has_release_debt("k0") is True, (
+            f"{label}: the ordinary commit erased the refused obligation"
+        )
+
+
+def test_an_acknowledged_commit_leaves_no_release_debt():
+    """Control: a hook that acknowledges keeps the release path free — the debt
+    exists only for deliveries nothing confirmed."""
+    from api.session_lifecycle import (
+        _reset_for_tests,
+        commit_pending_for_release,
+        has_release_debt,
+    )
+
+    _reset_for_tests()
+    agent = _RecordingCommitAgent(acknowledged=True, flushed=True)
+    _pending_session("s1", agent)
+
+    assert commit_pending_for_release("s1", agent) is True
+    assert has_release_debt("s1") is False
+
+
+def test_release_debt_clears_once_its_owner_confirms():
+    """The debt is latched to the exact owner/generation; an acknowledgement for
+    that delivery frees the release again."""
+    from api.session_lifecycle import (
+        _reset_for_tests,
+        commit_pending_for_release,
+        has_release_debt,
+    )
+
+    _reset_for_tests()
+    agent = _RecordingCommitAgent(acknowledged=None, flushed=True)
+    _pending_session("s1", agent)
+
+    assert commit_pending_for_release("s1", agent) is False
+    assert has_release_debt("s1") is True
+
+    agent._acknowledged = True  # the provider can confirm on a later attempt
+    assert commit_pending_for_release("s1", agent) is True
+    assert has_release_debt("s1") is False
+
+
+def test_release_debt_retries_from_its_own_state_when_the_segment_is_gone():
+    """Once an ordinary commit advanced the segment away, the debt's retained
+    owner/payload is the only retry route — and it must be the same payload."""
+    from api.session_lifecycle import (
+        _reset_for_tests,
+        commit_pending_for_release,
+        commit_session_memory,
+        has_release_debt,
+        has_uncommitted_work,
+    )
+
+    _reset_for_tests()
+    agent = _RecordingCommitAgent(acknowledged=None, flushed=True)
+    _pending_session("s1", agent)
+
+    assert commit_pending_for_release("s1", agent) is False   # latches the debt
+    latched_payload = agent.commits[0]
+
+    commit_session_memory("s1", agent=agent)                  # ordinary commit advances it
+    assert has_uncommitted_work("s1") is False
+
+    agent._acknowledged = True
+    assert commit_pending_for_release("s1", agent) is True
+    assert has_release_debt("s1") is False
+    assert agent.commits[-1] == latched_payload, "the debt retry used a different payload"
+
+
 def test_pressure_never_releases_a_swallowed_provider_failure_across_passes():
     """Same three-pass shape with a provider that throws inside the agent's
     swallow-all wrapper: indistinguishable from success from here, so it must
