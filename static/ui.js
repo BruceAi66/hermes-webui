@@ -21916,6 +21916,19 @@ function loadHtmlInline(container){
   });
 }
 
+// Identical replies reuse cached markdown HTML and therefore the same
+// data-mermaid-id; mermaid.render() then fails for every block after the
+// first because the id is already taken. Hand such a block a fresh id.
+function _uniqueMermaidRenderId(block){
+  let id=block.dataset.mermaidId||('m-'+Math.random().toString(36).slice(2));
+  const sel=(typeof CSS!=='undefined'&&CSS.escape)?CSS.escape(id):id;
+  if(document.getElementById(id)||document.querySelectorAll('[data-mermaid-id="'+sel+'"]').length>1){
+    id=id+'-'+Math.random().toString(36).slice(2,8);
+    block.dataset.mermaidId=id;
+  }
+  return id;
+}
+
 function renderMermaidBlocks(container){
   const root=container||document;
   const blocks=root.querySelectorAll('.mermaid-block:not([data-rendered])');
@@ -21945,7 +21958,7 @@ function renderMermaidBlocks(container){
   blocks.forEach(async(block)=>{
     block.dataset.rendered='true';
     const code=block.textContent;
-    const id=block.dataset.mermaidId||('m-'+Math.random().toString(36).slice(2));
+    const id=_uniqueMermaidRenderId(block);
     try{
       const {svg}=await mermaid.render(id,code);
       const tmp=document.getElementById('d'+id);

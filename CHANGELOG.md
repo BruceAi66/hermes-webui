@@ -135,6 +135,11 @@
 
 ### Fixed
 
+- **The same mermaid diagram in two replies now renders in both.** Identical replies reuse cached markdown, so both
+  diagrams carried the same render id; drawing the second one silently emptied the first (and a later identical reply
+  could fall back to a plain code block), even after a reload. Each diagram now gets its own id before it is drawn.
+  Thanks @johnDEFI. (#8159)
+
 - **New chats answer faster: the session ID no longer breaks the model's prompt cache.** Every new chat put its own
   session ID near the end of the system prompt, so no two chats ever shared a cacheable prompt and the model had to
   re-read it from that line on each time (on a local backend the reporter saw 15-18 s first responses drop to 2-3 s).

@@ -2013,6 +2013,8 @@ Each has automated API-level tests in `tests/test_sprint{N}.py`.
 
 ### Sprint 14: Visual Polish + Workspace Ops
 - Create a mermaid code block in a response. Verify diagram renders inline.
+- Send the same prompt twice so two replies contain an identical mermaid block. Verify both diagrams render
+  (neither falls back to a `mermaid` code block), on desktop and at phone width, and again after a page reload.
 - Message timestamps visible next to role labels (hover for full date).
 - Double-click a file in workspace panel to rename. Enter saves, Escape cancels.
 - Create a folder via folder icon in workspace header.
