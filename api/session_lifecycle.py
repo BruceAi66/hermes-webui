@@ -235,6 +235,24 @@ def _first_uncommitted_segment(entry: dict) -> dict | None:
     return None
 
 
+def _selected_transcript(owner) -> list | None:
+    """Snapshot the transcript belonging to the segment's OWNER.
+
+    The payload must come from the agent that owns the segment being committed.
+    The caller's cached agent is whoever is in the cache NOW, which is not
+    necessarily the dirty owner — a rebuild leaves the older handle owning its
+    earlier dirty generation — and delivering the replacement's transcript to
+    the older owner commits that generation with the wrong payload.  An owner
+    with no resident transcript yields None (no payload) rather than someone
+    else's messages: a wrong payload is worse than an empty one, because it
+    writes another generation's conversation into this one's memories.
+    """
+    messages = getattr(owner, "_session_messages", None)
+    if not isinstance(messages, list) or not messages:
+        return None
+    return list(messages)
+
+
 def _deliver_commit_messages(agent, messages, ack_sink: dict | None = None) -> None:
     """Deliver an explicit transcript to the agent's commit hook.
 
@@ -262,14 +280,19 @@ def _deliver_commit_messages(agent, messages, ack_sink: dict | None = None) -> N
 
 
 def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, timeout: float | None = None,
-                          messages: list | None = None, ack_sink: dict | None = None) -> bool:
+                          ack_sink: dict | None = None, require_ack: bool = False) -> bool:
     """Commit the earliest uncommitted segment for a session.
 
-    ``messages`` is the transcript captured by the caller; when supplied it is
-    delivered to the provider instead of an empty list (see
-    ``_deliver_commit_messages``).  ``ack_sink`` collects whether that delivery
-    was acknowledged — the release path uses it to decide whether the
-    transcript may be cleared.
+    The provider payload is the selected OWNER's retained transcript (see
+    ``_selected_transcript``), delivered instead of an empty list so a
+    batch-extraction provider's empty-input guard cannot skip the work.
+
+    ``ack_sink`` collects whether that delivery was acknowledged.  With
+    ``require_ack=True`` an unacknowledged delivery does NOT advance
+    ``committed_generation``: the generation stays dirty, keeping the obligation
+    visible to the next caller (same owner/generation, retried) instead of
+    turning into "nothing pending" — which would let a later pass clear the
+    transcript without a further extraction attempt.
     """
     if not session_id:
         return False
@@ -306,10 +329,26 @@ def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, ti
         captured_generation = segment["end"]
         entry["in_flight"] = True
 
+    # The payload belongs to the selected owner/generation, not to whichever
+    # agent happens to be cached now.
+    ack_state = ack_sink if ack_sink is not None else {}
     try:
-        _deliver_commit_messages(effective_agent, messages, ack_sink)
+        _deliver_commit_messages(effective_agent, _selected_transcript(effective_agent), ack_state)
     except Exception:
         logger.exception("commit_memory_session() failed for session %s", session_id)
+        with _condition:
+            re_entry = _sessions.get(session_id)
+            if re_entry is not None:
+                re_entry["in_flight"] = False
+            _condition.notify_all()
+        return False
+
+    if require_ack and not ack_state.get("acknowledged"):
+        # The delivery ran but nothing confirmed it (the installed agent returns
+        # None and swallows provider errors).  Leaving the generation dirty is
+        # what makes the refusal durable: the next caller still sees pending
+        # work and retries the same owner/generation instead of taking the
+        # "nothing pending" shortcut and clearing an unconfirmed transcript.
         with _condition:
             re_entry = _sessions.get(session_id)
             if re_entry is not None:
@@ -333,27 +372,27 @@ def commit_session_memory(session_id: str, agent=None, *, wait: bool = False, ti
     return True
 
 
-def commit_pending_for_release(session_id: str, agent, messages: list | None) -> bool:
+def commit_pending_for_release(session_id: str, agent) -> bool:
     """Commit pending memory work before a caller clears a session's transcript.
 
-    Used by the agent-cache pressure governor, which is about to empty
-    ``agent._session_messages``.  The transcript must not be dropped while work
-    that depends on it is uncommitted, and the commit must see the messages
-    themselves (providers with empty-input guards skip extraction otherwise).
+    Used by the agent-cache pressure governor, which is about to empty the
+    agent's transcript.  The transcript must not be dropped while work that
+    depends on it is uncommitted, and the commit must deliver the payload
+    itself (providers with empty-input guards skip extraction otherwise).
 
     Returns True only when the release is safe:
 
     * nothing is pending — the transcript is free to drop;
-    * or the commit ran with the explicit captured transcript, the agent
-      acknowledged the delivery, and nothing newer (including work registered by
-      a successor stream during the commit I/O) still depends on it.
+    * or the commit ran for the selected owner/generation, the delivery was
+      acknowledged, and nothing newer (including work a successor stream
+      registered during the commit I/O) still depends on it.
 
-    A False return means "keep the transcript": a skipped release costs memory,
-    a wrong one costs the user their memories.  Note the residual limitation on
-    the installed agent: ``AIAgent.commit_memory_session()`` returns None and
-    swallows provider exceptions inside its own teardown helper, so it can never
-    acknowledge — the transcript is retained for a later pass rather than
-    treated as extracted.
+    A False return means "keep the transcript", and the refusal is durable: an
+    unacknowledged or failed commit leaves the generation dirty, so a later pass
+    retries the same owner/generation instead of taking the "nothing pending"
+    shortcut.  On the installed agent — whose ``commit_memory_session()``
+    returns None and swallows provider exceptions — that means retention rather
+    than a release the runtime cannot back up.
     """
     if not session_id:
         return False
@@ -361,8 +400,8 @@ def commit_pending_for_release(session_id: str, agent, messages: list | None) ->
         return True
     ack: dict = {"acknowledged": False}
     if not commit_session_memory(session_id, agent=agent, wait=False,
-                                 messages=messages, ack_sink=ack):
-        return False  # in-flight elsewhere, raised, or no owner to commit with
+                                 ack_sink=ack, require_ack=True):
+        return False  # in-flight elsewhere, raised, or not acknowledged
     if has_uncommitted_work(session_id):
         # A successor registered (or completed) work while the commit I/O ran
         # outside the cache lock; that work still needs this transcript.

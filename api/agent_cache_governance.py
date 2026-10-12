@@ -303,23 +303,6 @@ def _agent_has_resident_transcript(agent: Any) -> bool:
         return False
 
 
-def _captured_transcript(agent: Any) -> Optional[list]:
-    """Snapshot the agent's resident transcript for an explicit commit delivery.
-
-    The release this feeds empties ``_session_messages``; the memory provider
-    must see the messages themselves, because batch-extraction providers skip
-    extraction behind an empty-input guard.  A shallow copy is enough — the
-    provider extracts from the message dicts — and it also stops a successor
-    turn that appends during the commit (which runs outside the cache lock) from
-    moving the list under us.  None means "nothing to deliver": the caller must
-    then not treat the commit as confirmed.
-    """
-    messages = getattr(agent, "_session_messages", None)
-    if not isinstance(messages, list) or not messages:
-        return None
-    return list(messages)
-
-
 def _pending_work_outstanding(session_id: str) -> bool:
     """True when uncommitted/in-flight memory work still needs the transcript.
 
@@ -347,20 +330,23 @@ def _commit_pending_memory(session_id: str, agent: Any) -> bool:
     real messages.
 
     Returns True when the release may proceed (nothing pending, or the
-    commit was delivered, acknowledged, and left nothing newer pending);
-    False when the transcript must be kept — pending work could not be
-    committed (in-flight elsewhere, provider failure, no message-accepting
-    commit hook), the commit was not acknowledged, or a successor registered
-    work during the commit I/O.
+    commit was delivered for the selected owner/generation, acknowledged, and
+    left nothing newer pending); False when the transcript must be kept —
+    pending work could not be committed (in-flight elsewhere, provider failure,
+    no message-accepting commit hook), the commit was not acknowledged, or a
+    successor registered work during the commit I/O.
+
+    The payload comes from the lifecycle: it belongs to the segment OWNER, not
+    to whichever agent is cached now (a rebuild leaves the older handle owning
+    its dirty generation), so the governor does not hand over the replacement's
+    transcript for an older owner's work.
     """
     if not _pending_work_outstanding(session_id):
         return True
     try:
         from api.streaming import _lifecycle_commit_pending_for_release
 
-        return bool(_lifecycle_commit_pending_for_release(
-            session_id, agent, _captured_transcript(agent),
-        ))
+        return bool(_lifecycle_commit_pending_for_release(session_id, agent))
     except Exception:
         logger.debug(
             "pending-memory commit before release failed for %s",

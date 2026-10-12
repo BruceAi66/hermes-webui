@@ -861,8 +861,8 @@ def test_pressure_release_skipped_when_commit_fails(monkeypatch):
 
 def test_commit_pending_memory_wiring(monkeypatch):
     """_commit_pending_memory consults the lifecycle registry: no pending
-    work → True (release proceeds); pending work → the release-gate commit with
-    the captured transcript and the captured agent."""
+    work → True (release proceeds); pending work → the release-gate commit for
+    the cached agent (the lifecycle picks the payload's owner)."""
     import api.agent_cache_governance as gmod
     import api.streaming as streaming
 
@@ -871,19 +871,15 @@ def test_commit_pending_memory_wiring(monkeypatch):
 
     monkeypatch.setattr(streaming, "_lifecycle_has_uncommitted_work", lambda sid: True)
 
-    def _fake_commit(session_id, agent=None, messages=None):
+    def _fake_commit(session_id, agent=None):
         seen["sid"] = session_id
         seen["agent"] = agent
-        seen["messages"] = messages
         return True
 
     monkeypatch.setattr(streaming, "_lifecycle_commit_pending_for_release", _fake_commit)
 
     assert gmod._commit_pending_memory("s1", agent) is True
-    assert seen["sid"] == "s1"
-    assert seen["agent"] is agent
-    assert seen["messages"] == agent._session_messages, "captured transcript not delivered"
-    assert seen["messages"] is not agent._session_messages, "the snapshot must be a copy"
+    assert seen == {"sid": "s1", "agent": agent}
 
     monkeypatch.setattr(streaming, "_lifecycle_has_uncommitted_work", lambda sid: False)
     seen.clear()
@@ -891,14 +887,15 @@ def test_commit_pending_memory_wiring(monkeypatch):
     assert seen == {}  # nothing pending — no commit call needed
 
 
-# ── pre-release memory extraction (transcript delivery + release gate) ───────
+# ── pre-release memory extraction (owner payload + durable release gate) ─────
 class _RecordingCommitAgent(_FakeAgent):
     """FakeAgent carrying the installed AIAgent commit contract.
 
     ``AIAgent.commit_memory_session(messages=None)`` forwards ``messages or []``
-    to the provider's on_session_end(); the installed implementation returns
-    None (it wraps provider I/O in a swallow-all helper), so a test can model
-    "acknowledged" by returning something truthy.
+    to the provider's on_session_end() and returns None, wrapping provider I/O
+    in a swallow-all helper — so a provider failure looks exactly like success.
+    Returning a truthy value models the acknowledgement the release gate needs;
+    the default (None) is the installed behaviour.
     """
 
     def __init__(self, acknowledged=None, **kw):
@@ -911,23 +908,45 @@ class _RecordingCommitAgent(_FakeAgent):
         return self._acknowledged
 
 
-def _pending_session(session_id, agent, messages=("remember this",)):
+class _SwallowingCommitAgent(_FakeAgent):
+    """Installed contract with a FAILING provider.
+
+    The real agent runs the provider call through ``_quietly(...)``, so a throw
+    is swallowed and the hook still returns None: the caller cannot tell the
+    extraction never happened.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.attempts = 0
+
+    def commit_memory_session(self, messages=None):
+        self.attempts += 1
+        try:
+            raise RuntimeError("provider exploded")
+        except RuntimeError:
+            pass  # _quietly()
+        return None
+
+
+def _pending_session(session_id, agent, text="remember this"):
     """Register a session with one completed (therefore committable) turn."""
     from api.session_lifecycle import mark_turn_completed, register_agent
 
-    captured = [{"role": "user", "content": text} for text in messages]
-    agent._session_messages = list(captured)
-    agent._last_flushed_db_idx = len(captured)
+    messages = [{"role": "user", "content": text}]
+    agent._session_messages = list(messages)
+    agent._last_flushed_db_idx = len(messages)
     register_agent(session_id, agent)
     mark_turn_completed(session_id, agent=agent)
-    return captured
+    return messages
 
 
-def test_commit_pending_for_release_delivers_explicit_transcript():
-    """The pre-release commit must hand the provider the captured transcript.
+def test_commit_pending_for_release_delivers_the_selected_owner_transcript():
+    """The pre-release commit must hand the provider the real transcript.
 
-    Omitting the argument makes the provider see [] and skip extraction behind
-    its empty-input guard while the governor reports the work as committed.
+    Calling the hook with no payload (or an empty list) makes a
+    batch-extraction provider skip extraction behind its empty-input guard while
+    the governor treats the work as done.
     """
     from api.session_lifecycle import _reset_for_tests, commit_pending_for_release
 
@@ -935,8 +954,8 @@ def test_commit_pending_for_release_delivers_explicit_transcript():
     agent = _RecordingCommitAgent(acknowledged=True, flushed=True)
     captured = _pending_session("s1", agent)
 
-    assert commit_pending_for_release("s1", agent, captured) is True
-    assert agent.commits == [captured], "the provider did not receive the captured transcript"
+    assert commit_pending_for_release("s1", agent) is True
+    assert agent.commits == [captured], "the provider did not receive the transcript"
 
 
 def test_commit_pending_for_release_retains_transcript_without_acknowledgement():
@@ -944,17 +963,40 @@ def test_commit_pending_for_release_retains_transcript_without_acknowledgement()
 
     The installed agent swallows provider errors and returns None, so success
     and failure are indistinguishable from here.  Nothing acknowledged the
-    delivery, so the transcript is kept (a skipped release costs memory, a wrong
-    one costs the user their memories).
+    delivery, so the release is refused — and the refusal must be durable: the
+    generation stays dirty, otherwise the next caller takes the "nothing
+    pending" shortcut and clears the transcript with no further attempt.
     """
-    from api.session_lifecycle import _reset_for_tests, commit_pending_for_release
+    from api.session_lifecycle import (
+        _reset_for_tests,
+        commit_pending_for_release,
+        has_uncommitted_work,
+    )
 
     _reset_for_tests()
     agent = _RecordingCommitAgent(acknowledged=None, flushed=True)
     captured = _pending_session("s1", agent)
 
-    assert commit_pending_for_release("s1", agent, captured) is False
+    assert commit_pending_for_release("s1", agent) is False
     assert agent.commits == [captured], "the transcript was still delivered"
+    assert has_uncommitted_work("s1") is True, (
+        "the obligation was marked committed without an acknowledgement: the "
+        "next pass would clear the transcript with no extraction attempt"
+    )
+
+
+def test_unacknowledged_refusal_is_retried_by_the_next_caller():
+    """The next caller must re-attempt the same owner/generation, not take the
+    "nothing pending" shortcut."""
+    from api.session_lifecycle import _reset_for_tests, commit_pending_for_release
+
+    _reset_for_tests()
+    agent = _RecordingCommitAgent(acknowledged=None, flushed=True)  # installed contract
+    captured = _pending_session("s1", agent)
+
+    assert commit_pending_for_release("s1", agent) is False
+    assert commit_pending_for_release("s1", agent) is False
+    assert agent.commits == [captured, captured], "the retry must reuse the same payload"
 
 
 def test_commit_pending_for_release_fails_closed_when_the_hook_rejects_messages():
@@ -970,9 +1012,9 @@ def test_commit_pending_for_release_fails_closed_when_the_hook_rejects_messages(
             calls.append(True)
 
     agent = _LegacySignatureAgent(flushed=True)
-    captured = _pending_session("s1", agent)
+    _pending_session("s1", agent)
 
-    assert commit_pending_for_release("s1", agent, captured) is False
+    assert commit_pending_for_release("s1", agent) is False
     # The arity mismatch raises before the hook body runs: nothing was
     # extracted, so nothing may authorize clearing the transcript.
     assert calls == []
@@ -990,7 +1032,7 @@ def test_commit_pending_for_release_keeps_transcript_when_a_successor_registers_
 
     _reset_for_tests()
     agent = _RecordingCommitAgent(acknowledged=True, flushed=True)
-    captured = _pending_session("s1", agent)
+    _pending_session("s1", agent)
 
     original = agent.commit_memory_session
 
@@ -1001,35 +1043,78 @@ def test_commit_pending_for_release_keeps_transcript_when_a_successor_registers_
 
     agent.commit_memory_session = _commit_then_successor
 
-    assert commit_pending_for_release("s1", agent, captured) is False
+    assert commit_pending_for_release("s1", agent) is False
 
 
-def test_commit_pending_for_release_keeps_transcript_for_a_second_dirty_owner():
-    """A session can carry pending work from more than one owner (a failed
-    commit, then an agent rebuild).  Committing only the oldest segment must not
-    authorize clearing the transcript while the newer owner's work is pending.
+def test_dirty_owners_each_receive_their_own_transcript():
+    """Owner, generation and payload are selected together.
+
+    A rebuild leaves the older handle owning its earlier dirty generation; the
+    older owner must receive ITS transcript, not the cached replacement's (the
+    re-gate measured both hooks receiving the NEW owner's memory).
     """
     from api.session_lifecycle import (
         _reset_for_tests,
         commit_pending_for_release,
-        mark_turn_completed,
         register_agent,
     )
 
     _reset_for_tests()
     old = _RecordingCommitAgent(acknowledged=True, flushed=True)
     new = _RecordingCommitAgent(acknowledged=True, flushed=True)
-    register_agent("s1", old)
-    mark_turn_completed("s1", agent=old)      # segment 1 — owned by the old agent
+    old_msgs = _pending_session("s1", old, text="OLD owner memory")
     register_agent("s1", new)
-    captured = _pending_session("s1", new)    # segment 2 — owned by the new agent
+    new_msgs = _pending_session("s1", new, text="NEW owner memory")
 
-    assert commit_pending_for_release("s1", new, captured) is False
-    assert old.commits, "the oldest segment should still have been committed"
-    assert new._session_messages, "the newer owner's work still needs the transcript"
+    # First call commits the earliest dirty segment (the OLD owner) with the OLD
+    # owner's own payload; the newer generation is still pending, so the
+    # transcript is kept.
+    assert commit_pending_for_release("s1", new) is False
+    assert old.commits == [old_msgs], "the old owner received the wrong payload"
+    assert new.commits == []
+
+    # Second call commits the NEW segment with the NEW owner's payload.
+    assert commit_pending_for_release("s1", new) is True
+    assert new.commits == [new_msgs]
+    assert old.commits == [old_msgs], "the old owner must not be re-committed"
 
 
-def test_pressure_release_delivers_messages_before_dropping(monkeypatch):
+def test_failed_old_owner_stays_retryable_with_its_own_payload():
+    """A throwing older owner keeps ITS generation dirty, and the retry reuses
+    the same owner/generation/payload — never the replacement's."""
+    from api.session_lifecycle import (
+        _reset_for_tests,
+        commit_pending_for_release,
+        has_uncommitted_work,
+        register_agent,
+    )
+
+    _reset_for_tests()
+    old = _RecordingCommitAgent(acknowledged=True, flushed=True)
+    new = _RecordingCommitAgent(acknowledged=True, flushed=True)
+    old_msgs = _pending_session("s1", old, text="OLD owner memory")
+    register_agent("s1", new)
+    _pending_session("s1", new, text="NEW owner memory")
+
+    attempts = {"n": 0}
+    original = old.commit_memory_session
+
+    def _flaky(messages=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("provider down")
+        return original(messages)
+
+    old.commit_memory_session = _flaky
+
+    assert commit_pending_for_release("s1", new) is False   # old owner threw
+    assert has_uncommitted_work("s1") is True
+    assert commit_pending_for_release("s1", new) is False   # retried, still the new segment pending
+    assert attempts["n"] == 2
+    assert old.commits == [old_msgs], "the retry must reuse the old owner's own payload"
+
+
+def test_pressure_release_delivers_the_transcript_before_dropping(monkeypatch):
     """End-to-end through the real lifecycle: a session with pending work is
     released only after the provider received the captured transcript."""
     from api.session_lifecycle import _reset_for_tests
@@ -1061,3 +1146,49 @@ def test_pressure_release_retains_transcript_when_commit_is_unacknowledged():
     assert g.sweep_pressure(rss_mb=500) == 0
     assert agent._session_messages, "transcript dropped without a confirmed commit"
     assert agent.commits and agent.commits[0]
+
+
+def test_pressure_never_releases_an_unacknowledged_commit_across_passes():
+    """Three PASSES with the installed method (returns None).
+
+    The previous head retained the transcript in pass one but had already marked
+    the obligation committed, so pass two took the "nothing pending" shortcut
+    and cleared it with no extraction attempt (the re-gate measured
+    ``drops=[0,1,0]`` for both a successful and a throwing provider).  Every
+    pass must refuse the release AND keep the obligation dirty, so each pass
+    retries the delivery.
+    """
+    from api.session_lifecycle import _reset_for_tests
+
+    _reset_for_tests()
+    agent = _RecordingCommitAgent(acknowledged=None, flushed=True)
+    cache = _cache_with([("k0", agent)])
+    _pending_session("k0", agent)
+
+    g = _governor(cache, memory_high_mb=100, protect_recent=0,
+                  running_check=lambda k: False)
+    drops = [g.sweep_pressure(rss_mb=500) for _ in range(3)]
+
+    assert drops == [0, 0, 0], f"an unconfirmed commit authorised a release: {drops}"
+    assert agent._session_messages, "transcript cleared although nothing acknowledged extraction"
+    assert len(agent.commits) == 3, "each pass must retry the delivery"
+
+
+def test_pressure_never_releases_a_swallowed_provider_failure_across_passes():
+    """Same three-pass shape with a provider that throws inside the agent's
+    swallow-all wrapper: indistinguishable from success from here, so it must
+    stay retained and retried rather than released one pass later."""
+    from api.session_lifecycle import _reset_for_tests
+
+    _reset_for_tests()
+    agent = _SwallowingCommitAgent(flushed=True)
+    cache = _cache_with([("k0", agent)])
+    _pending_session("k0", agent)
+
+    g = _governor(cache, memory_high_mb=100, protect_recent=0,
+                  running_check=lambda k: False)
+    drops = [g.sweep_pressure(rss_mb=500) for _ in range(3)]
+
+    assert drops == [0, 0, 0], f"a swallowed provider failure authorised a release: {drops}"
+    assert agent._session_messages
+    assert agent.attempts == 3
