@@ -7316,6 +7316,49 @@ function _mergeUsageForCtxIndicator(latest, fallback){
 }
 
 // Context usage indicator in composer footer
+// ── 费用显示单位:DeepSeek 原厂按人民币(LOCAL PATCH)────────────────────────────
+// DeepSeek 官方价目以人民币计(元/百万 tokens),而 Hermes 核心只输出美元估算:
+// 其内置 DeepSeek 快照 = 官方人民币价 ÷ 固定比价(flash 1/0.15 = 4/0.60 =
+// 0.02/0.003 = 6.6667;v4-pro 4.5/0.66 = 13.5/1.98 = 0.15/0.022 = 6.8182),
+// 所以按该比价还原即可精确回到官方人民币金额,无需引入汇率猜测。
+// 高峰时段(北京时间周一~周五 9:00-12:00、14:00-18:00)核心已按 2 倍计价。
+// 来源:https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+const _DEEPSEEK_CNY_PER_USD = {
+  'deepseek-flash': 20 / 3,            // ¥1 / $0.15
+  'deepseek-v4-pro': 4.5 / 0.66,       // ¥4.5 / $0.66
+};
+// 同一档价钱的旧模型名(官方:请求由 V4.1-Flash 提供服务并按 Flash 价格计费)
+const _DEEPSEEK_FLASH_IDS = ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'];
+
+function _deepseekCnyPerUsd(model, provider){
+  const rawModel=String(model||'');
+  const id=rawModel.split('/').pop().trim().toLowerCase();
+  const prov=String(provider||'').trim().toLowerCase();
+  // 只认「DeepSeek 原厂」路由:显式 provider=deepseek,或无 provider 且模型名不带 vendor 前缀
+  const direct=prov==='deepseek'||(prov===''&&!rawModel.includes('/'));
+  if(!direct) return null;
+  if(_DEEPSEEK_CNY_PER_USD[id]!=null) return _DEEPSEEK_CNY_PER_USD[id];
+  if(_DEEPSEEK_FLASH_IDS.indexOf(id)>=0) return _DEEPSEEK_CNY_PER_USD['deepseek-flash'];
+  return null;
+}
+
+// 当前会话的模型/供应商(会话数据是唯一事实源;usage 载荷多数路径不带 model)
+function _costSessionMeta(){
+  const s=(typeof S!=='undefined'&&S&&S.session)?S.session:{};
+  return {model:s.model||'', provider:s.model_provider||s.provider||''};
+}
+
+// 费用字符串:DeepSeek 原厂 → ¥,其余路由维持 $ (金额为 0/无效时返回空串)
+function fmtSessionCost(usd, model, provider){
+  const v=Number(usd);
+  if(!Number.isFinite(v)||v<=0) return '';
+  const meta=_costSessionMeta();
+  const factor=_deepseekCnyPerUsd(model!=null?model:meta.model, provider!=null?provider:meta.provider);
+  if(factor==null) return v<0.01?`$${v.toFixed(4)}`:`$${v.toFixed(2)}`;
+  const cny=v*factor;
+  return cny<1?`¥${cny.toFixed(4)}`:`¥${cny.toFixed(2)}`;
+}
+
 function _syncCtxIndicator(usage){
   const wrap=$('ctxIndicatorWrap');
   const el=$('ctxIndicator');
@@ -7388,7 +7431,7 @@ function _syncCtxIndicator(usage){
   const contextLabel=hasPostCompressionEstimate?'Estimated next model context':'Context window';
   let label=hasPromptTok?`${contextLabel} ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
   if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
-  if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+  if(cost) label+=` \u00b7 ${fmtSessionCost(cost)}`;
   if(cacheText) label+=` \u00b7 ${cacheText}`;
   el.setAttribute('aria-label',label);
   const usageText=hasPromptTok?(overflowed?`${contextLabel}: ${rawPct}% used (context exceeded)`:`${contextLabel}: ${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
@@ -7410,7 +7453,7 @@ function _syncCtxIndicator(usage){
   let costText='';
   if(costLine){
     if(cost){
-      costText=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+      costText=`Estimated cost: ${fmtSessionCost(cost)}`;
       if(cacheText) costText+=` \u00b7 ${cacheText}`;
       costLine.style.display='';
       costLine.textContent=costText;
@@ -18921,7 +18964,7 @@ function renderMessages(options){
         const outTok=msg._turnUsage.output_tokens||0;
         const cost=msg._turnUsage.estimated_cost;
         let text=`${_fmtTokens(inTok)} in · ${_fmtTokens(outTok)} out`;
-        if(cost) text+=` · ~$${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+        if(cost) text+=` · ~${fmtSessionCost(cost,msg._usedModel)}`;
         const cacheHitPct=msg._turnUsage.cache_hit_percent;
         if(cacheHitPct!=null) text+=` · ${t('usage_cached_percent',cacheHitPct)}`;
         usage.textContent=text;

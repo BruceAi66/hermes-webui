@@ -1964,7 +1964,7 @@ function _formatStatusTokens(s){
   const cost=Number(s.estimated_cost??lastUsage.estimated_cost??0)||0;
   if(!total&&!cost) return t('status_no_tokens');
   const fmtNum=n=>Number(n||0).toLocaleString();
-  return `${fmtNum(input)} in / ${fmtNum(output)} out${cost?` (~$${cost.toFixed(4)})`:''}`;
+  return `${fmtNum(input)} in / ${fmtNum(output)} out${cost?` (${fmtSessionCost(cost,s.model,s.model_provider)})`:''}`;
 }
 function _statusProviderForSession(s){
   if(s.model_provider) return String(s.model_provider);
