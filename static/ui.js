@@ -685,8 +685,42 @@ function _cancelMessageVirtualizedRender(){
     _messageVirtualScrollRaf=0;
   }
 }
+// #7882 (gate round-7 CORE): a hidden delegation_wakeup row sits between the
+// parent's answer and the follow-up's answer in the RAW transcript. The
+// renderer only walks RENDERABLE rows, so hiding the wakeup deletes the
+// user-turn boundary: the two answers land in ONE .assistant-turn container,
+// and installing the follow-up's Worklog hides every earlier segment in that
+// container (the parent's answer ends up display:none). Turn ownership must
+// therefore be derived from the RAW messages: a user-role row is a turn
+// boundary even when it never acquires a DOM row — but ONLY for rows that
+// would otherwise be ordinary visible user turns. Compaction markers,
+// preserved task lists and recovery-control rows are skipped WITHOUT
+// resetting the container today (they `continue` before the isUser branch or
+// are filtered out entirely), so they must not bump the boundary either.
+function _rawTurnBoundaryByRawIdx(messages){
+  const out=new Map();
+  if(!Array.isArray(messages)) return out;
+  let boundary=-1;
+  let rawIdx=0;
+  for(const m of messages){
+    if(m&&m.role&&m.role!=='tool'){
+      const isUserRow=m.role==='user';
+      const skipNoReset=!isUserRow
+        ||_isContextCompactionMessage(m)
+        ||_isPreservedCompressionTaskListMessage(m)
+        ||_isRecoveryControlMessage(m);
+      if(!skipNoReset) boundary=rawIdx;
+      out.set(rawIdx,boundary);
+    }
+    rawIdx++;
+  }
+  return out;
+}
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
+  // Internal delegation handoffs remain in S.messages for model/recovery state,
+  // but never acquire a transcript row (including attachment-only rows).
+  if(m._source==='delegation_wakeup') return false;
   if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
@@ -1035,6 +1069,17 @@ function _messageRawIdxForSessionIndex(sessionIdx){
   const n=Number(sessionIdx);
   if(!Number.isFinite(n)) return null;
   return n-_messageSessionIndexBase();
+}
+// Current S.messages index of the message a rendered row shows. data-msg-idx is
+// relative to the _oldestIdx at render time and goes stale when full history
+// loads without a re-render (opening the outline does that); the row's
+// data-session-msg-idx is absolute and does not. Edit, regenerate and fork turn
+// this into an absolute keep_count (#2184), so a stale value truncated or forked
+// at the wrong turn.
+function _rowCurrentRawIdx(row, fallback){
+  const abs=row&&row.dataset?Number(row.dataset.sessionMsgIdx):NaN;
+  const raw=Number.isSafeInteger(abs)&&abs>=0?_messageRawIdxForSessionIndex(abs):null;
+  return Number.isSafeInteger(raw)&&raw>=0?raw:fallback;
 }
 function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container){
   const idx=Math.max(0,Number(visibleIdx)||0);
@@ -1449,7 +1494,7 @@ function _applyUserRowIntrinsicHeight(row, rawText){
   const h=Math.max(remembered, estimate);
   if(h>0) row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
 }
-function _measureMessageVirtualRow(inner, entry){
+function _measureMessageVirtualRow(inner, entry, deferredWrites){
   if(!inner||!entry) return 0;
   const primary=inner.querySelector(`[data-msg-idx="${entry.rawIdx}"]`);
   if(!primary) return 0;
@@ -1470,8 +1515,18 @@ function _measureMessageVirtualRow(inner, entry){
   // extract it without this helper (they stub every collaborator by name).
   if(totalHeight>0 && primary.dataset && primary.dataset.role==='user'
      && typeof _rememberUserRowIntrinsicHeight==='function'){
+    // _rememberUserRowIntrinsicHeight below is a plain JS map write; only the
+    // contain-intrinsic-size assignment invalidates layout. Callers that measure a
+    // whole row set pass a pending buffer (#7677) so every style write lands AFTER
+    // every geometry read — the read/write interleaving this used to do made row N's
+    // getBoundingClientRect() force a fresh full-document layout after row N-1's
+    // write, i.e. N rows cost N layouts on a transcript that can be hundreds of
+    // thousands of pixels tall. No buffer (direct/legacy callers) keeps the
+    // immediate inline write.
     _rememberUserRowIntrinsicHeight(primary.dataset.sessionMsgIdx, totalHeight);
-    primary.style.containIntrinsicSize='auto '+Math.round(totalHeight)+'px';
+    const intrinsic='auto '+Math.round(totalHeight)+'px';
+    if(Array.isArray(deferredWrites)) deferredWrites.push({row:primary,intrinsic:intrinsic});
+    else primary.style.containIntrinsicSize=intrinsic;
   }
   return totalHeight;
 }
@@ -1481,10 +1536,15 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
   let changed=false;
   let measuredCount=0;
   let measuredTotal=0;
+  // #7677 read/write separation: the whole measurement pass is READS FIRST
+  // (every row's getBoundingClientRect()), then one WRITE phase that flushes the
+  // deferred contain-intrinsic-size values. All the reads therefore share a
+  // single layout instead of forcing one per row.
+  const deferredWrites=[];
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
     const entry=renderVisWithIdx[vi];
     if(!entry) continue;
-    const totalHeight=_measureMessageVirtualRow(inner, entry);
+    const totalHeight=_measureMessageVirtualRow(inner, entry, deferredWrites);
     if(totalHeight<=0) continue;
     const visibleIdx=Number(renderVisibleIdxs&&renderVisibleIdxs[vi]);
     if(!Number.isFinite(visibleIdx)) continue;
@@ -1494,6 +1554,10 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     }
     measuredTotal+=totalHeight;
     measuredCount++;
+  }
+  for(let wi=0;wi<deferredWrites.length;wi++){
+    const pending=deferredWrites[wi];
+    if(pending&&pending.row) pending.row.style.containIntrinsicSize=pending.intrinsic;
   }
   if(measuredCount>0){
     _messageVirtualEstimatedRowHeight=Math.max(60, Math.round(measuredTotal/measuredCount));
@@ -4514,10 +4578,37 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||compactText;
+  const pickerState=(typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel, sel.value)
+    : { model: sel.value||'', model_provider: null };
+  const pickerModel=pickerState.model||sel.value||'';
+  const _bareRouteModel=(v)=>{
+    const s=String(v||'').trim();
+    const p=(typeof _providerFromModelValue==='function')?String(_providerFromModelValue(s)||''):'';
+    const pre=p?`@${p}:`:'';
+    return (pre&&s.toLowerCase().startsWith(pre.toLowerCase()))?s.slice(pre.length):s;
+  };
+  const _pickerProv=String(pickerState.model_provider||'').trim().toLowerCase();
+  const _sessProv=String((S.session&&S.session.model_provider)||'').trim().toLowerCase();
+  // Only an explicit picker pick (the user chose a model in this tab) can make
+  // the session's served-model attribution stale. A dropdown that restored a
+  // fallback option on its own is not a user choice, so keep the attribution.
+  const _explicitPick=(S.session&&typeof _readExplicitPickerPick==='function')
+    ? _readExplicitPickerPick(S.session.session_id)
+    : null;
+  const routeMatches=!S.session||!S.session.model||!_explicitPick||(
+    _bareRouteModel(pickerModel).toLowerCase()===_bareRouteModel(S.session.model).toLowerCase()
+    &&(!_pickerProv||!_sessProv||_pickerProv===_sessProv)
+  );
+  const activeRouting=routeMatches?gatewayRouting:null;
+  const fallbackModel=(routeMatches&&S.session&&S.session.last_used_model)?S.session.last_used_model:(sel.value||'');
+  const fallbackText=(routeMatches&&S.session&&S.session.last_used_model)
+    ? _compactComposerModelChipLabel(S.session.last_used_model, getModelLabel(S.session.last_used_model))
+    : compactText;
+  const displayText=_formatGatewayModelLabel(fallbackModel,fallbackText,activeRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
-  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
+  chip.title=activeRouting?`${fallbackModel||'Conversation model'} ${_gatewayRoutingLabel(activeRouting)}`:(fallbackModel||'Conversation model');
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
@@ -5407,6 +5498,14 @@ async function selectModelFromDropdown(value){
   const sameModel=String(currentState.model||'')===String(value||'');
   const sameProvider=String(currentState.model_provider||'')===String(provider||'');
   if(sameModel&&sameProvider){ closeModelDropdown(); return; }
+  if(S.session){
+    const sessionModelChanged = String(S.session.model || '') !== String(value || '')
+      || String(S.session.model_provider || '') !== String(provider || '');
+    if(sessionModelChanged){
+      S.session.last_used_model = null;
+      S.session.gateway_routing = null;
+    }
+  }
   // Resolve the provider-specific option so duplicate bare IDs (e.g. gpt-5.5
   // under OpenAI Codex vs OpenRouter) update session model_provider correctly.
   if(typeof _ensureModelOptionInDropdown==='function'){
@@ -7292,10 +7391,36 @@ function _activityLastObservedAge(group){
   if(!Number.isFinite(stamp)||stamp<=0)return null;
   return Math.max(0,_activityNowSeconds()-stamp);
 }
+function _intlFormatter(locales, options){
+  // Shared Intl.DateTimeFormat cache for per-row timestamp labels: building a
+  // formatter per row dominated long-transcript renders. The browser's default
+  // locale/time zone can change while the page is open (OS time-zone change),
+  // so re-check it once per task (one probe per render, not per row) and drop
+  // every cached formatter when it differs.
+  const f=_intlFormatter;
+  if(!f._envChecked){
+    const o=new Intl.DateTimeFormat().resolvedOptions();
+    const env=o.locale+'|'+o.timeZone;
+    if(env!==f._env||!f._cache){ f._cache=new Map(); f._env=env; }
+    f._envChecked=true;
+    queueMicrotask(()=>{ f._envChecked=false; });
+  }
+  const key=JSON.stringify([locales,options]);
+  let fmt=f._cache.get(key);
+  if(!fmt){ fmt=new Intl.DateTimeFormat(locales,options); f._cache.set(key,fmt); }
+  return fmt;
+}
 function _activityClockLabel(ts){
   const stamp=Number(ts||_activityNowSeconds());
   if(!Number.isFinite(stamp)||stamp<=0)return'';
-  try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
+  try{
+    const d=new Date(stamp*1000);
+    // Date's locale methods return "Invalid Date", whereas Intl.format throws.
+    if(isNaN(d.getTime()))return d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    const opts={hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
+  }catch(_){return'';}
 }
 // Full date+time label for the worklog event-time tooltip (title attr). Guards the
 // same valid-Date range as _timestampSeconds so a bad epoch never yields "Invalid
@@ -7306,7 +7431,9 @@ function _activityFullClockLabel(ts){
   try{
     const d=new Date(stamp*1000);
     if(isNaN(d.getTime()))return'';
-    return d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    const opts={year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
   }catch(_){return'';}
 }
 function _timestampSeconds(value){
@@ -8235,11 +8362,51 @@ function _gatewayModelWarningText(routing){
   const used=getModelLabel(routing.used_model||'served model');
   return`Model switched: ${requested} → ${used}`;
 }
+function _canonicalModelForCompare(val){
+  if(!val) return '';
+  let str=String(val).trim().toLowerCase();
+  const colonIdx=str.lastIndexOf(':');
+  if(colonIdx!==-1) str=str.slice(colonIdx+1);
+  const slashIdx=str.lastIndexOf('/');
+  if(slashIdx!==-1) str=str.slice(slashIdx+1);
+  return str;
+}
+
 function _latestGatewayRoutingForSession(session){
   if(!session)return null;
-  if(session.gateway_routing)return session.gateway_routing;
-  const history=Array.isArray(session.gateway_routing_history)?session.gateway_routing_history:[];
-  return history.length?history[history.length-1]:null;
+  const fromHistory=!session.gateway_routing;
+  const routing=session.gateway_routing||(Array.isArray(session.gateway_routing_history)&&session.gateway_routing_history.length?session.gateway_routing_history[session.gateway_routing_history.length-1]:null);
+  if(!routing)return null;
+  const _canonical=(typeof _canonicalModelForCompare==='function')
+    ? _canonicalModelForCompare
+    : (val)=>{
+        if(!val) return '';
+        let str=String(val).trim().toLowerCase();
+        const colonIdx=str.lastIndexOf(':');
+        if(colonIdx!==-1) str=str.slice(colonIdx+1);
+        const slashIdx=str.lastIndexOf('/');
+        if(slashIdx!==-1) str=str.slice(slashIdx+1);
+        return str;
+      };
+  if(routing.requested_model&&session.model){
+    const reqModel=_canonical(routing.requested_model);
+    const sessModel=_canonical(session.model);
+    if(reqModel&&sessModel&&reqModel!==sessModel){
+      return null;
+    }
+  }
+  // Canonical provider identity matching: case-insensitive, preserves legacy/empty
+  const hasExplicitRoute=routing.requested_route_provider!==undefined&&routing.requested_route_provider!==null&&String(routing.requested_route_provider).trim()!=='';
+  const sessProvider=String(session.model_provider||'').trim().toLowerCase();
+  if(hasExplicitRoute){
+    const routeProvider=String(routing.requested_route_provider).trim().toLowerCase();
+    if(sessProvider && routeProvider && routeProvider !== sessProvider) return null;
+  } else if(fromHistory){
+    const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
+    // Fail closed on provider-less history candidate when active route has an explicit provider
+    if(sessProvider && (!reqProvider || reqProvider !== sessProvider)) return null;
+  }
+  return routing;
 }
 
 function _stripXmlToolCallsDisplay(s){
@@ -9138,7 +9305,16 @@ function lockComposerForClarify(placeholderText){
   // card is active (and survives page refresh / syncs across clients).
   const sid = S && S.session && S.session.session_id;
   if (sid && typeof _saveComposerDraftNow === 'function') {
-    _saveComposerDraftNow(sid, input.value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    const saveText = String(input.value || '');
+    const saveFiles = Array.isArray(S && S.pendingFiles) ? [...S.pendingFiles] : [];
+    try {
+      const saveResult = _saveComposerDraftNow(sid, saveText, saveFiles);
+      if (saveResult && typeof saveResult.catch === 'function') {
+        saveResult.catch((error)=>_handleComposerDraftPostFailure(error,sid,saveText,saveFiles));
+      }
+    } catch (error) {
+      _handleComposerDraftPostFailure(error,sid,saveText,saveFiles);
+    }
   }
   if(!_composerLockState){
     _composerLockState={
@@ -10845,22 +11021,33 @@ function renderTodoEmptyState(options={}){
 }
 
 function renderTodoRow(todo,options={}){
+  // ONE shared row renderer for all three Todos surfaces (sidebar panel,
+  // workspace-panel tab, in-chat tray). The tray used to hand-roll its own
+  // markup with tray-only class hooks, which duplicated this function and left
+  // dead CSS behind; it now calls this with {compact:true, rowClass:'...'}
+  // (reviewer re-gate 2026-10-08T03:10:50Z, "tidy the shared-row renderer").
   const td=todo||{};
+  const opts=options||{};
   const status=todoStatusKey(td.status);
   const visual=todoStatusVisual(status);
-  const showMetadata=!(options&&options.metadata===false);
+  const showMetadata=!(opts.metadata===false);
+  const compact=!!opts.compact;
+  const rowClass=opts.rowClass?(' '+String(opts.rowClass)):'';
   const isCompleted=status==='completed';
   const isCancelled=status==='cancelled';
   const contentColor=(isCompleted||isCancelled)?'var(--muted)':'var(--text)';
   const completedStyle=(isCompleted||isCancelled)?'text-decoration:line-through;opacity:.5':'';
   const metadata=showMetadata
-    ? `<div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(status)}</div>`
+    ? `<div class="todos-meta" style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(status)}</div>`
     : '';
+  const gap=compact?8:10;
+  const padY=compact?5:6;
+  const contentSize=compact?'12.5px':'13px';
   return `
-    <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${visual.color}">${renderTodoStatusIcon(status,14)}</span>
-      <div style="flex:1;min-width:0">
-        <div style="font-size:13px;color:${contentColor};${completedStyle};line-height:1.4">${esc(todoContent(td))}</div>
+    <div class="todos-row${rowClass}" style="display:flex;align-items:flex-start;gap:${gap}px;padding:${padY}px 0;border-bottom:1px solid var(--border);">
+      <span class="todos-status" style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${visual.color}">${renderTodoStatusIcon(status,14)}</span>
+      <div class="todos-body" style="flex:1;min-width:0">
+        <div class="todos-content" style="font-size:${contentSize};color:${contentColor};${completedStyle};line-height:1.4;overflow-wrap:anywhere">${esc(todoContent(td))}</div>
         ${metadata}
       </div>
     </div>`;
@@ -10877,6 +11064,373 @@ function _todosPanelIsActive(){
   return !!(panel&&panel.classList&&panel.classList.contains('active'));
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Chat todos: embedded collapsible task list at the top of the chat area.
+// Opt-in via the "Show task list in chat" checkbox (localStorage-backed,
+// frontend-only preference — no server settings round-trip needed).
+// When enabled, the sidebar Todos panel is hidden to avoid duplication.
+// ────────────────────────────────────────────────────────────────────────
+const CHAT_TODOS_LS_KEY='hermes-webui-chat-todos';
+let _chatTodosEnabled=null;             // null = uninitialised; true/false once known
+let _chatTodosInitialised=false;
+
+function _chatTodosReadPref(){
+  try{
+    const v=localStorage.getItem(CHAT_TODOS_LS_KEY);
+    // Default OFF (opt-in): the tray hides the sidebar Todos tab and paints a
+    // floating overlay in the transcript, so it must never appear for existing
+    // users who never asked for it. Only an explicit '1' turns it on.
+    if(v===null) return false;
+    return v==='1';
+  }catch(_){return false;}
+}
+function _chatTodosWritePref(v){
+  try{
+    // Persist both states explicitly ('1' enabled / '0' disabled). Removing the
+    // key on false would re-collide with the opt-in default and make a user's
+    // choice to enable the tray vanish on reload.
+    localStorage.setItem(CHAT_TODOS_LS_KEY,v?'1':'0');
+  }catch(_){}
+}
+function chatTodosEnabled(){
+  if(_chatTodosEnabled===null) _chatTodosEnabled=_chatTodosReadPref();
+  return _chatTodosEnabled;
+}
+function _setChatTodosEnabled(v){
+  _chatTodosEnabled=!!v;
+  _chatTodosWritePref(_chatTodosEnabled);
+  if(typeof _syncChatTodosRailVisibility==='function') _syncChatTodosRailVisibility();
+}
+function _syncChatTodosRailVisibility(){
+  // When the in-chat tray is active, hide the sidebar Todos panel so the
+  // user never has two competing todo surfaces.
+  const enabled=chatTodosEnabled();
+  if(enabled){
+    document.querySelectorAll('[data-panel="todos"]').forEach(function(el){
+      el.classList.add('nav-tab-hidden');
+    });
+  }else if(typeof _applyTabVisibility==='function'&&typeof _getHiddenTabs==='function'){
+    // Tray OFF: hand visibility back to its canonical owner. Unconditionally
+    // REMOVING nav-tab-hidden here also revealed a Todos entry the user had
+    // hidden independently through hidden_tabs, so an explicitly hidden tab
+    // reappeared immediately (or after reload). Deferring to
+    // _applyTabVisibility re-derives the tab's own preference instead.
+    //
+    // …but only once the mirror IS that preference. While a profile switch's
+    // /api/settings reconciliation is still in flight, localStorage still holds
+    // the PREVIOUS profile's hidden_tabs/tab_order, so re-deriving here would
+    // reimpose the old profile's tab visibility on the profile now in effect: a
+    // Todos entry the current profile hides pops back, or one it shows stays
+    // hidden, until settings refresh (greptile P1, 2026-10-08T20:06:51Z). Skip
+    // the window — the pending reconciliation re-runs _applyTabVisibility with
+    // the profile's own snapshot and already honours the tray's new state.
+    if(typeof _tabVisibilitySnapshotStale!=='function'||!_tabVisibilitySnapshotStale()){
+      _applyTabVisibility(_getHiddenTabs());
+    }
+  }
+  // If the sidebar Todos panel is currently open, bounce back to chat.
+  if(enabled){
+    const panel=document.getElementById('panelTodos');
+    if(panel&&panel.classList&&panel.classList.contains('active')&&typeof switchPanel==='function'){
+      switchPanel('chat',{fromRailClick:false});
+    }
+  }
+  // The workspace-panel Todos tab (Settings ▸ "Show Todos tab in workspace
+  // panel") is a third Todos surface: it must follow the tray too, otherwise
+  // the two settings contradict each other (reviewer re-gate 2026-10-07T18:08:02Z).
+  if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
+}
+// The tray is an in-flow strip, so the shell carries a marker class while it is
+// visible. CSS uses it to drop the floating Start jump pill below the strip
+// instead of letting it paint over the tray (reviewer re-gate 2026-10-07T18:08:02Z).
+let _chatTodosResizeObserver=null;
+// Last measured height of the strip's real box. The transcript is only re-pinned
+// when that box actually GREW (reviewer re-gate 2026-10-08T03:10:50Z).
+let _chatTodosRepinH=0;
+function _measureChatTodosTrayHeight(){
+  const tray=(typeof $==='function')?$('chatTodosPanel'):null;
+  if(!tray||tray.hidden) return 0;
+  try{ return (tray.getBoundingClientRect?tray.getBoundingClientRect().height:0)||0; }catch(_){ return 0; }
+}
+function _publishChatTodosHeight(){
+  // Measure the tray's ACTUAL box and publish it on the shell: CSS offsets the
+  // Start jump pill by it instead of the fixed 43px that only cleared the
+  // collapsed band and let the pill paint inside the expanded rows
+  // (re-gate 2026-10-07T20:13:25Z, [SHOULD-FIX] 2).
+  //
+  // Guarded on purpose: a hidden tray measures 0 and must never clobber a real
+  // height with 0. The observer below republishes as soon as the box is real
+  // again, so the guard no longer strands a stale value (re-gate
+  // 2026-10-07T23:49:23Z).
+  if(typeof document==='undefined'||!document.querySelector) return 0;
+  const shell=document.querySelector('.messages-shell');
+  if(!shell||!shell.style) return 0;
+  // The measured box is CEILed: the whole-tray cap below can leave a fractional
+  // height, and rounding DOWN shaved the Start pill's >=7px clearance
+  // (reviewer re-gate 2026-10-08T09:54:47Z, must-fix 1).
+  const h=Math.ceil(_measureChatTodosTrayHeight());
+  if(h>0&&shell.style.setProperty) shell.style.setProperty('--chat-todos-h',h+'px');
+  return h;
+}
+function _syncChatTodosShellClass(visible){
+  if(typeof document==='undefined'||!document.querySelector) return;
+  const shell=document.querySelector('.messages-shell');
+  if(shell&&shell.classList){
+    shell.classList.toggle('chat-todos-visible',!!visible);
+    if(!visible){
+      if(shell.style&&shell.style.removeProperty) shell.style.removeProperty('--chat-todos-h');
+      return;
+    }
+    _publishChatTodosHeight();
+  }
+}
+function _ensureChatTodosResizeObserver(){
+  // Lifecycle-owned tray observer. The strip's box changes on schedules that
+  // never call renderChatTodos()/toggleChatTodos(): resizing ACROSS the tray
+  // breakpoint (the strip grows 236px -> 276px at 393 -> 1440) and a hidden
+  // tray becoming visible again after Settings edits hydrate the list while
+  // chat is hidden (0 -> 276px, which kept the stale 77px and painted the
+  // whole Start pill inside the task rows). Observing the real box covers both,
+  // so the pill follows the tray's actual box instead of the last render's
+  // measurement (re-gate 2026-10-07T23:49:23Z).
+  if(typeof ResizeObserver!=='function') return;
+  if(typeof document==='undefined'||!document.querySelector) return;
+  const tray=(typeof $==='function')?$('chatTodosPanel'):null;
+  if(!tray) return;
+  if(_chatTodosResizeObserver&&_chatTodosResizeObserver._tray===tray) return;
+  if(_chatTodosResizeObserver&&_chatTodosResizeObserver.disconnect) _chatTodosResizeObserver.disconnect();
+  _chatTodosResizeObserver=null;
+  try{
+    const ro=new ResizeObserver(function(){
+      // Only a visible strip owns the pill offset: while chat is hidden the box
+      // measures 0 and publishing that would leave the pill un-offset. The
+      // hidden -> visible flip re-fires this observer with the real box.
+      const shell=document.querySelector('.messages-shell');
+      if(!(shell&&shell.classList&&shell.classList.contains('chat-todos-visible'))) return;
+      _publishChatTodosHeight();
+      // The bottom fade is a function of the tray's box too: a list that fit
+      // when it was rendered starts scrolling after a shorter viewport or a
+      // taller composer, and with scrollTop still 0 the cue stayed hidden, so
+      // the clipped list read as the complete list until something else
+      // refreshed it (Greptile P2 2026-10-09T21:45:10Z).
+      _updateChatTodosScrollCue();
+      // The repin's own growth gate decides whether the reader moves: a 0px
+      // hidden box records "nothing on screen", so the visible flip still counts
+      // as a real growth (reviewer re-gate 2026-10-08T03:10:50Z).
+      _repinChatTodosTranscript();
+    });
+    ro._tray=tray;
+    ro.observe(tray);
+    _chatTodosResizeObserver=ro;
+  }catch(_){ _chatTodosResizeObserver=null; }
+}
+function _syncChatTodosExpanded(open){
+  const tray=$('chatTodosPanel');
+  if(tray){
+    if(open) tray.classList.add('open');
+    else tray.classList.remove('open');
+  }
+  const head=$('chatTodosHead');
+  if(head&&head.setAttribute) head.setAttribute('aria-expanded',open?'true':'false');
+}
+function _chatTodosToggleEnabled(checked){
+  _setChatTodosEnabled(checked);
+  // The tray force-hides the sidebar Todos entry, so its visibility chip must be
+  // repainted here: toggling the tray from Settings changed nothing on screen
+  // while the chip kept reporting ON (re-gate 2026-10-07, static/ui.js:10503).
+  if(typeof _renderTabVisibilityChips==='function') _renderTabVisibilityChips();
+  // Keep the settings checkbox in sync for callers that toggle the tray from
+  // elsewhere (e.g. the tab-visibility chip that owns the same hide).
+  const prefCb=$('settingsChatTodosInChat');
+  if(prefCb) prefCb.checked=!!checked;
+  const tray=$('chatTodosPanel');
+  if(tray) tray.hidden=!checked;
+  // Enabling always (re)starts collapsed, and collapsing must drop the
+  // header's aria-expanded too — otherwise a tray expanded, turned off and
+  // turned back on is announced as expanded while its body is hidden.
+  _syncChatTodosExpanded(false);
+  renderChatTodos();
+  // Deliberately no whole-transcript rebuild here: the tray is an absolutely
+  // positioned overlay outside the message scroller, so toggling it changes no
+  // transcript layout (a full re-render cost ~256 ms at 300 messages).
+  //
+  // Deliberately NO appearance autosave either (reviewer re-gate
+  // 2026-10-08T23:19:27Z, static/ui.js:11074): the tray preference is persisted
+  // in localStorage by _setChatTodosEnabled above, whereas an appearance save
+  // would POST hidden_tabs/_getHiddenTabs() — a mirror that can still hold a
+  // stale server snapshot. Toggling the tray from Settings then clobbered a
+  // newer hidden_tabs a sibling client had written (verified over real HTTP:
+  // server []; toggling the tray saved ["todos","memory"] back). Explicit
+  // visibility-chip edits keep their own autosave.
+}
+
+// ── Chat todos summary ──────────────────────────────────────────────────
+function _currentTodos(){
+  // `todoStateMeta` is the sentinel for an explicit snapshot (live todo_state
+  // SSE or session cold-load). Without it, S.todos may hold the empty array
+  // hydration installs for an imported/legacy session whose tasks only exist
+  // as role:"tool" messages — returning that array would bypass the legacy
+  // renderer and hide a list that renders today. Explicit empty snapshots
+  // (meta present) still win.
+  if(S.todoStateMeta) return Array.isArray(S.todos)?S.todos:[];
+  if(typeof _legacyTodosFromMessages==='function'){
+    const legacy=_legacyTodosFromMessages();
+    if(Array.isArray(legacy)) return legacy;
+  }
+  return [];
+}
+function _chatTodosSummary(todos){
+  const active=todos.filter(t=>t&&t.status!=='completed'&&t.status!=='cancelled').length;
+  const total=todos.length;
+  if(!total) return {text:t('todos_no_active')||'No active tasks',active:0,total:0};
+  const text=active===0
+    ?t('todos_tray_summary_done',total)
+    :t('todos_tray_summary_active',active,total);
+  return {text,active,total};
+}
+function _repinChatTodosTranscript(){
+  // The tray is IN FLOW, so showing/growing it shrinks the transcript viewport.
+  // The earlier fix re-pinned on EVERY render path — including the feature-OFF
+  // default where the tray is hidden and nothing resized at all — which yanked a
+  // reader who had scrolled up with Auto-follow OFF back to the bottom
+  // (reviewer re-gate 2026-10-08T03:10:50Z, [SHOULD-FIX] 1). Two gates now:
+  //   1. Auto-follow OFF => never touch the scroll position (the setting only
+  //      suppresses AUTOMATIC following; a deliberate jump is explicit).
+  //   2. Re-pin only when the strip's measured box actually GREW. A shrink
+  //      cannot strand a pinned reader: a growing viewport only lowers
+  //      scrollHeight - clientHeight, which the browser clamps for us.
+  // The helper below is a no-op anyway when the reader scrolled away.
+  //
+  // The box must be measured BEFORE the Auto-follow gate (reviewer re-gate
+  // 2026-10-08T06:40:51Z, [SHOULD-FIX]): when the gate returned first, a hide
+  // with Auto-follow OFF never recorded the zero height, so a later re-show
+  // with follow ON compared against the stale pre-hide height, read "not
+  // grown", and skipped the re-pin — stranding a pinned reader. Tracking the
+  // box unconditionally (follow OUT of the measurement) keeps the baseline
+  // honest; only the ACTUAL re-pin stays gated. The measurement is CEILed here
+  // too, so the growth test compares against the SAME number the pill offset
+  // publishes (reviewer re-gate 2026-10-08T09:54:47Z, must-fix 1).
+  const h=Math.ceil(_measureChatTodosTrayHeight());
+  const grew=h>_chatTodosRepinH;
+  _chatTodosRepinH=h;
+  if(typeof window!=='undefined'&&window._autoScrollFollow===false) return;
+  if(!grew) return;
+  if(typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
+}
+function renderChatTodos(){
+  if(typeof $!=='function'||typeof document==='undefined') return;
+  const tray=$('chatTodosPanel');
+  if(!tray) return;
+  // Keep the lifecycle-owned box observer alive across every path that can
+  // (re)create or re-show the tray (re-gate 2026-10-07T23:49:23Z).
+  _ensureChatTodosResizeObserver();
+  if(!chatTodosEnabled()){
+    tray.hidden=true;
+    _syncChatTodosShellClass(false);
+    _repinChatTodosTranscript();
+    return;
+  }
+  const todos=_currentTodos();
+  if(!todos.length){
+    tray.hidden=true;
+    _syncChatTodosShellClass(false);
+    _repinChatTodosTranscript();
+    return;
+  }
+  tray.hidden=false;
+  _syncChatTodosShellClass(true);
+  _repinChatTodosTranscript();
+  // ONE progress label (reviewer re-gate 2026-10-07T18:08:02Z): the header
+  // used to print the active count twice (summary + counter). The summary span
+  // is generated text, so it also no longer carries data-i18n and is filled
+  // here for every locale.
+  const summary=_chatTodosSummary(todos);
+  const summaryEl=$('chatTodosSummary');
+  if(summaryEl) summaryEl.textContent=summary.text;
+  if(!tray.classList.contains('open')){
+    // Collapsed: header only. Render body lazily when expanded.
+    return;
+  }
+  const body=$('chatTodosBody');
+  if(!body) return;
+  // ONE shared row renderer (sidebar panel / workspace Todos tab / this tray), so
+  // the tray can never drift from the other Todos surfaces (reviewer re-gate
+  // 2026-10-08T03:10:50Z, "tidy the shared-row renderer").
+  const rows=renderTodoRows(todos,{metadata:false,compact:true,rowClass:'chat-todos-row'});
+  // The rows live in their own centred column so they line up with the
+  // transcript's reading column instead of spanning the full shell width
+  // (reviewer re-gate 2026-10-08T03:10:50Z).
+  body.innerHTML=`<div class="chat-todos-rows">${rows||`<div class="chat-todos-empty">${esc(t('todos_no_active'))}</div>`}</div>`;
+  _wireChatTodosScrollCue();
+  _updateChatTodosScrollCue();
+  // The expanded body's height depends on the row count (and growing a list is
+  // the case the reviewer measured a 199px gap on), so re-publish the strip
+  // height for the Start pill and re-pin the transcript to its new bottom.
+  _syncChatTodosShellClass(true);
+  _repinChatTodosTranscript();
+}
+function toggleChatTodos(){
+  const tray=$('chatTodosPanel');
+  if(!tray) return;
+  const isOpen=!tray.classList.contains('open');
+  _syncChatTodosExpanded(isOpen);
+  if(isOpen) renderChatTodos();
+  // Expanding/collapsing resizes the in-flow strip, so refresh the published
+  // height (Start pill offset) and re-pin the transcript on BOTH transitions —
+  // collapsing must not leave the scroller short either (re-gate
+  // 2026-10-07T20:13:25Z).
+  _syncChatTodosShellClass(!tray.hidden);
+  _repinChatTodosTranscript();
+  // Opening/closing the disclosure changes which rows are visible, so the
+  // "more below" cue is re-derived on both transitions (re-gate 2026-10-08).
+  _updateChatTodosScrollCue();
+}
+function _initChatTodos(){
+  if(_chatTodosInitialised) return;
+  _chatTodosInitialised=true;
+  if(typeof document==='undefined') return;
+  _chatTodosEnabled=chatTodosEnabled();
+  _syncChatTodosRailVisibility();
+  const tray=$('chatTodosPanel');
+  if(tray){
+    if(!chatTodosEnabled()){
+      tray.hidden=true;
+      _syncChatTodosShellClass(false);
+      return;
+    }
+    tray.hidden=false;
+    // In-flow strip: start collapsed so it costs only the ~35px header band.
+    _syncChatTodosShellClass(true);
+    _wireChatTodosScrollCue();
+    renderChatTodos();
+  }
+}
+
+// ── Overflow cue for the capped expanded body ──────────────────────────────
+// Below ~768px the body is capped (200px) and its scrollbar is an overlay that
+// mobile browsers only reveal while scrolling, so a capped list looked like a
+// complete one (reviewer re-gate 2026-10-08T03:10:50Z, "a mobile overflow cue
+// when the capped body scrolls"). The cue is a bottom fade published on the
+// wrapper, shown only while there is still content below the fold.
+let _chatTodosCueWired=false;
+function _wireChatTodosScrollCue(){
+  if(_chatTodosCueWired) return;
+  const body=$('chatTodosBody');
+  if(!body||!body.addEventListener) return;
+  _chatTodosCueWired=true;
+  body.addEventListener('scroll',_updateChatTodosScrollCue,{passive:true});
+}
+function _updateChatTodosScrollCue(){
+  const body=$('chatTodosBody');
+  const wrap=$('chatTodosBodyWrap');
+  if(!body||!wrap||!wrap.classList) return;
+  let moreBelow=false;
+  try{
+    moreBelow=(body.scrollHeight-body.clientHeight)>2&&(body.scrollHeight-body.scrollTop-body.clientHeight)>2;
+  }catch(_){ moreBelow=false; }
+  wrap.classList.toggle('chat-todos-overflowing',moreBelow);
+}
+
 function scheduleTodosRefresh(){
   // Idempotent: many `todo_state` events fire on each tool result, but
   // only the latest snapshot needs to paint.  RAF lets us coalesce
@@ -10885,6 +11439,7 @@ function scheduleTodosRefresh(){
   if(typeof requestAnimationFrame!=='function'){
     if(typeof loadTodos==='function') loadTodos();
     if(typeof _refreshWorkspacePanelTodos==='function') _refreshWorkspacePanelTodos();
+    if(typeof renderChatTodos==='function') renderChatTodos();
     return;
   }
   _todosRenderRafId=requestAnimationFrame(()=>{
@@ -10892,6 +11447,7 @@ function scheduleTodosRefresh(){
     const sidebarActive=_todosPanelIsActive();
     if(sidebarActive&&typeof loadTodos==='function') loadTodos();
     if(typeof _refreshWorkspacePanelTodos==='function') _refreshWorkspacePanelTodos();
+    if(typeof renderChatTodos==='function') renderChatTodos();
   });
 }
 
@@ -11307,6 +11863,8 @@ function _syncSystemHealthMonitorVisibility(){
 document.addEventListener('visibilitychange',_syncSystemHealthMonitorVisibility);
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',startSystemHealthMonitor);
 else startSystemHealthMonitor();
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initChatTodos);
+  else _initChatTodos();
 
 // ── Hermes agent/gateway heartbeat alert (#716) ──
 const AGENT_HEALTH_INTERVAL_MS=30000;
@@ -12333,14 +12891,42 @@ function getPendingSessionMessage(session, messagesOverride=null){
       ? _sameTranscriptMessage(row,pendingCandidate)
       : String(msgContent(row)||'').trim()===text;
   };
+  const _rowIdentityMatchesPending=(row)=>{
+    if(!row) return false;
+    if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(row,session)) return true;
+    const ts=_messageTimestampSeconds(row);
+    const startedAt=Number(session?.pending_started_at);
+    return ts!==null&&Number.isFinite(startedAt)&&startedAt>0
+      &&Math.abs(ts-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON;
+  };
   const _adoptExistingRow=(row)=>{
     if(attachments.length&&!row.attachments?.length) row.attachments=attachments;
+    // #quiet-delegation: a state.db copy adopted on reload may predate the
+    // _source stamp (deferred save). Carry the pending turn's provenance so
+    // the hidden-row predicate still applies to the adopted row — but ONLY on
+    // identity proof (token or exact timestamp). Text equality alone must
+    // never stamp a real earlier row hidden (#quiet-delegation gate review
+    // finding 4).
+    const pendingSource=session?.pending_user_source;
+    if(pendingSource&&row&&!row._source&&_rowIdentityMatchesPending(row)) row._source=pendingSource;
     return null;
   };
   const currentTailUser=_pendingCurrentTailUserMessage(messages);
   if(currentTailUser){
     const sameCurrentTurn=_matchesPending(currentTailUser);
-    if(sameCurrentTurn) return _adoptExistingRow(currentTailUser);
+    if(sameCurrentTurn){
+      // A wakeup-sourced pending prompt that text-matches a real row WITHOUT
+      // the pending turn's token/timestamp identity must not swallow that
+      // row: leave it alone and materialize the pending row separately, so a
+      // delegation_wakeup stamp can never hide a real user turn (gate review
+      // finding 4). Ordinary webui prompts keep text-only dedupe — their row
+      // is never hidden and the deferred-save flow relies on it.
+      const pendingSource=session?.pending_user_source;
+      const wakeupSourced=!!pendingSource&&pendingSource!=='webui';
+      if(!wakeupSourced||_rowIdentityMatchesPending(currentTailUser)){
+        return _adoptExistingRow(currentTailUser);
+      }
+    }
   }
   // Fallback: the current turn's user row is already in the transcript but the
   // strict tail scan above could not see it because this turn's assistant/tool
@@ -12391,11 +12977,16 @@ async function checkInflightOnBoot(sid) {
 
 function _topbarLoadedMessageCount(){
   const messages=Array.isArray(S.messages)?S.messages:[];
-  return messages.filter(m=>m&&m.role&&m.role!=='tool').length;
+  return messages.filter(m=>m&&m.role&&m.role!=='tool'&&m._source!=='delegation_wakeup').length;
 }
 function _topbarMessageMetaText(){
   const loadedCount=_topbarLoadedMessageCount();
-  const totalCount=Number(S.session&&S.session.message_count);
+  // #quiet-delegation: prefer the server's visible count (hidden internal
+  // rows excluded) so "N of M messages" never counts delegation handoffs.
+  // Fall back to the raw count on servers that don't send it yet.
+  const rawTotal=Number(S.session&&S.session.message_count);
+  const visibleTotal=Number(S.session&&S.session.visible_message_count);
+  const totalCount=Number.isFinite(visibleTotal)&&visibleTotal>=0?visibleTotal:rawTotal;
   const hasTotal=Number.isFinite(totalCount)&&totalCount>0;
   const isTruncated=!!(typeof _messagesTruncated!=='undefined'&&_messagesTruncated);
   if(isTruncated&&hasTotal&&totalCount>loadedCount){
@@ -12785,10 +13376,11 @@ function _assistantVisibleContentForReasoningCompare(m){
   if(_isAssistantEmptyPlaceholderContent(m, content)) return '';
   return String(content||'');
 }
-function _assistantTurnFinalVisibleContentMap(visWithIdx){
+function _assistantTurnFinalVisibleContentMap(visWithIdx, turnBoundaryByRawIdx){
   const out=new Map();
   let runIdxs=[];
   let finalVisible='';
+  let runTurnId;
   const flush=()=>{
     for(const idx of runIdxs) out.set(idx, finalVisible);
     runIdxs=[];
@@ -12796,7 +13388,19 @@ function _assistantTurnFinalVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
+    // #7882 (gate round-7 CORE): a hidden delegation_wakeup row between two
+    // answers is still a turn boundary — flush the run when the raw turn
+    // owner changes even though the boundary row never renders. The entry
+    // that triggered the flush STARTS the next run (a split, not a drop).
+    const turnId=turnBoundaryByRawIdx?turnBoundaryByRawIdx.get(entry.rawIdx):undefined;
+    if(m&&m.role==='assistant'&&(!turnBoundaryByRawIdx||turnId===runTurnId||runIdxs.length===0)){
+      if(runIdxs.length===0) runTurnId=turnId;
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) finalVisible=visible;
+    }else if(m&&m.role==='assistant'&&runIdxs.length){
+      flush();
+      runTurnId=turnId;
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
       if(String(visible||'').trim()) finalVisible=visible;
@@ -12807,10 +13411,11 @@ function _assistantTurnFinalVisibleContentMap(visWithIdx){
   flush();
   return out;
 }
-function _assistantTurnVisibleContentMap(visWithIdx){
+function _assistantTurnVisibleContentMap(visWithIdx, turnBoundaryByRawIdx){
   const out=new Map();
   let runIdxs=[];
   let visibleTexts=[];
+  let runTurnId;
   const flush=()=>{
     for(const idx of runIdxs) out.set(idx, visibleTexts.slice());
     runIdxs=[];
@@ -12818,7 +13423,15 @@ function _assistantTurnVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
+    const turnId=turnBoundaryByRawIdx?turnBoundaryByRawIdx.get(entry.rawIdx):undefined;
+    if(m&&m.role==='assistant'&&(!turnBoundaryByRawIdx||turnId===runTurnId||runIdxs.length===0)){
+      if(runIdxs.length===0) runTurnId=turnId;
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) visibleTexts.push(visible);
+    }else if(m&&m.role==='assistant'&&runIdxs.length){
+      flush();
+      runTurnId=turnId;
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
       if(String(visible||'').trim()) visibleTexts.push(visible);
@@ -13875,7 +14488,9 @@ function _applyTransparentRowFading(turn){
   const rows=Array.from(blocks.querySelectorAll(':scope > .transparent-event-row'));
   const isLive=turn.id==='liveAssistantTurn'||turn.getAttribute('data-live-assistant-turn')==='1';
   if(!isLive){
-    rows.forEach(row=>row.removeAttribute('data-transparent-fade'));
+    rows.forEach(row=>{
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+    });
     return;
   }
   const total=rows.length;
@@ -13883,9 +14498,15 @@ function _applyTransparentRowFading(turn){
     const row=rows[i];
     // Newest = full opacity; each step back drops by 1 (floors at 5).
     const stepsFromEnd=total-1-i;
-    if(stepsFromEnd<=0){row.removeAttribute('data-transparent-fade');continue;}
+    if(stepsFromEnd<=0){
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+      continue;
+    }
     const step=Math.min(5,stepsFromEnd);
-    row.setAttribute('data-transparent-fade',String(step));
+    const stepStr=String(step);
+    if(row.getAttribute('data-transparent-fade')!==stepStr){
+      row.setAttribute('data-transparent-fade',stepStr);
+    }
   }
 }
 // Resolve the assistant message that carries a transparent turn's settled
@@ -13963,7 +14584,10 @@ function _renderTransparentTurnFooter(turn, opts){
       turn.appendChild(footer);
     }
   }
-  footer.innerHTML=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  const targetHtml=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  if(footer.innerHTML!==targetHtml){
+    footer.innerHTML=targetHtml;
+  }
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
 // When the user manually expands the live "Activity" dropdown during streaming,
@@ -15746,6 +16370,15 @@ function _computeTransparentHiddenPrefixCount(rows){
 // renderMessages({preserveScroll:true}) call and cleared after the settled-scene
 // render pass; null at all other times.
 let _keepSettledWorklogOpenForStreamId=null;
+// #7677: PRE-INIT snapshot taken by the keep-open settle render (renderMessages
+// computes `cacheHtml` before highlightCode/addCopyButtons/initTreeViews and
+// deliberately does NOT cache the forced-open DOM, #5260). When the settle chain
+// then skips the unarmed rebuild, _cacheSettledTranscriptHtml() publishes this
+// stash so the session still lands in _sessionHtmlCache. Capturing it here —
+// rather than from the live DOM afterwards — is what keeps restored controls
+// working: innerHTML cannot save onclick handlers, and addCopyButtons() /
+// initTreeViews() skip already-initialized markup on restore.
+let _settleKeepOpenCacheStash=null;
 function _shouldKeepSettledWorklogOpenForStreamSettle(streamId){
   // Round 6 scroll-jump guard: collapsing the JUST-settled live worklog into a
   // compact summary at STREAM_DONE shrinks the transcript by hundreds of px. The
@@ -15792,6 +16425,138 @@ function _assistantTurnHasVisibleRenderedSegment(turn){
   }
   return false;
 }
+// #7677 (terminal settlement). STREAM_DONE renders the just-settled turn with the
+// keep-open token armed, disarms, then collapses that turn in place — or falls back
+// to a SECOND full transcript rebuild. The in-place collapse below keys off the
+// settled-scene OWNER group, which only the NON-transparent settled renderer stamps
+// (_renderSettledAnchorSceneForMessage), so transparent streams never matched a
+// group and ALWAYS paid the second rebuild: the "~11 s of every turn" of this issue,
+// on top of an already multi-second first render.
+//
+// The only armed-keep-open effect the TRANSPARENT settled renderer honors is the
+// per-turn row-cap exemption (`justSettled` in
+// _renderSettledAnchorSceneTransparentForMessage): while the token is armed the
+// just-settled turn renders its activity rows in FULL, and the unarmed rebuild's
+// only job is to re-cap that one turn behind a "Show earlier steps" affordance. So
+// whenever the armed render left the turn within the cap slack — including the
+// common plain reply whose scene has no activity rows at all — the unarmed rebuild
+// would produce exactly the same DOM and there is nothing left to collapse.
+//
+// Fail closed in every other case: non-transparent stream, a worklog-worthy scene
+// whose rows are not in the rendered transcript (windowing / cache divergence), or
+// a turn over the cap that an unarmed rebuild WOULD re-cap. Cost is never traded
+// for correctness — the second render stays the fallback.
+// #7677 (review P1). The UNARMED rebuild's decision to re-cap a turn is taken
+// from the SCENE'S ROW LIST (`_anchorSceneRowsForRendering(...,{settled:true})`)
+// and the turn's revealed state — never from what happens to sit in the DOM.
+// Rows that render no node at all (hidden reasoning) are still in that list, so
+// counting the nodes the ARMED render left behind can read cap+slack while the
+// list is longer, and declare the second render redundant while an unarmed
+// rebuild would still re-cap the turn to its last 30 rows + a "Show earlier
+// steps" affordance. Any row source we cannot read fails CLOSED (pay the second
+// render); correctness is never traded for the saved rebuild.
+function _transparentSettledTurnWouldBeCapped(inner, scene, rawIdx){
+  if(!scene) return false;
+  if(typeof _anchorSceneRowsForRendering!=='function') return true;
+  let rows=null;
+  try{ rows=_anchorSceneRowsForRendering(scene,{settled:true}); }catch(_e){ rows=null; }
+  if(!Array.isArray(rows)) return true;
+  if(rows.length<=_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK) return false;
+  // #5966 Codex F3: the persistent revealed set is authoritative — an already
+  // revealed turn is never re-capped by a rebuild. The DOM flag
+  // (data-transparent-earlier-revealed) is only the renderer's same-render fast
+  // path; ignoring it here fails toward the second render, i.e. the safe side.
+  if(typeof _transparentRevealKey==='function'
+     &&typeof _transparentRevealedTurns!=='undefined'
+     &&_transparentRevealedTurns&&typeof _transparentRevealedTurns.has==='function'){
+    const session=(typeof S!=='undefined'&&S)?S.session:null;
+    if(_transparentRevealedTurns.has(_transparentRevealKey(session&&session.session_id, rawIdx))) return false;
+  }
+  return true;
+}
+// #7677 (review P2 / r2 P1). STREAM_DONE's unarmed second render was also the
+// pass that wrote the settled transcript into _sessionHtmlCache (the keep-open
+// ARMED render is deliberately uncached, #5260). Skipping that rebuild therefore
+// used to leave the session uncached, so switching away and back paid a full
+// rebuild. Publish the PRE-INIT snapshot the armed render stashed — no rebuild —
+// under exactly the gates renderMessages() applies to its own cache write: the
+// stash must belong to the live session, no in-flight stream, no transient
+// compression/handoff card, and <300 KB of HTML. Reading the LIVE DOM here would
+// be wrong: by settle time it is post-init, and innerHTML cannot carry the copy
+// buttons' / tree views' onclick handlers, so restored controls would be dead.
+function _cacheSettledTranscriptHtml(){
+  try{
+    if(typeof _settleKeepOpenCacheStash==='undefined'||!_settleKeepOpenCacheStash) return false;
+    const stash=_settleKeepOpenCacheStash;
+    const sid=stash.sid;
+    const currentSid=(typeof S!=='undefined'&&S&&S.session)?S.session.session_id:null;
+    if(!sid||sid!==currentSid) return false;
+    if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) return false;
+    const w=(typeof window!=='undefined')?window:null;
+    const hasTransient=!!(w&&(
+      (w._compressionUi&&(!w._compressionUi.sessionId||w._compressionUi.sessionId===sid))||
+      (w._handoffUi&&(!w._handoffUi.sessionId||w._handoffUi.sessionId===sid))
+    ));
+    if(hasTransient) return false;
+    if(!stash.html||stash.html.length>=300000) return false;
+    if(typeof _sessionHtmlCache==='undefined'||!_sessionHtmlCache||typeof _sessionHtmlCache.set!=='function') return false;
+    if(typeof _sessionHtmlCacheSid!=='undefined') _sessionHtmlCacheSid=sid;
+    _sessionHtmlCache.set(sid,{
+      html:stash.html,
+      msgCount:stash.msgCount,
+      renderWindowKey:stash.renderWindowKey,
+      signature:stash.signature,
+    });
+    if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
+    _settleKeepOpenCacheStash=null;
+    return true;
+  }catch(_e){ return false; }
+}
+function _transparentSettledTurnSecondRenderIsRedundant(streamId){
+  if(!streamId) return false;
+  if(typeof isTransparentStream!=='function'||!isTransparentStream()) return false;
+  const inner=$('msgInner');
+  if(!inner||typeof inner.querySelectorAll!=='function') return false;
+  const messages=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
+  const ownerIdxs=[];
+  const ownerScenes=[];
+  let ownerScene=null;
+  for(let i=0;i<messages.length;i++){
+    const m=messages[i];
+    if(!m||String(m._anchor_stream_id||'')!==String(streamId)) continue;
+    ownerIdxs.push(String(i));
+    ownerScenes.push(m._anchor_activity_scene||null);
+    ownerScene=m._anchor_activity_scene||ownerScene;
+  }
+  if(!ownerIdxs.length) return false;
+  // #7677 (review P1): decide with the renderer's own inputs first — if the
+  // unarmed rebuild would re-cap ANY of this stream's owner turns, the second
+  // render is not redundant no matter what the armed render left in the DOM.
+  if(typeof _transparentSettledTurnWouldBeCapped==='function'){
+    for(let k=0;k<ownerScenes.length;k++){
+      if(!ownerScenes[k]) continue;
+      if(_transparentSettledTurnWouldBeCapped(inner, ownerScenes[k], Number(ownerIdxs[k]))) return false;
+    }
+  }
+  // The transparent settled renderer stamps each row node with the owner message's
+  // RAW index (data-anchor-owner-idx); count only this stream's settled rows.
+  // This stays as the SECOND guard: it catches a turn whose scene rows are not in
+  // the rendered transcript at all (windowing / cache divergence), where the row
+  // list alone cannot prove the two renders match.
+  let renderedRows=0;
+  const nodes=inner.querySelectorAll('[data-anchor-owner-idx][data-anchor-settled-scene-row="1"]');
+  for(let i=0;i<nodes.length;i++){
+    if(ownerIdxs.indexOf(String(nodes[i]&&nodes[i].getAttribute('data-anchor-owner-idx')))>=0) renderedRows++;
+  }
+  if(!renderedRows){
+    // No settled rows rendered for this turn: a rebuild is a no-op unless the scene
+    // is worklog-worthy (its rows would appear — but then they would be here).
+    if(!ownerScene) return true;
+    if(typeof _anchorSceneSceneHasWorklogWorthyRows!=='function') return false;
+    return !_anchorSceneSceneHasWorklogWorthyRows(ownerScene);
+  }
+  return renderedRows<=(_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK);
+}
 function _collapseJustSettledWorklogInPlace(streamId){
   // #6414: STREAM_DONE used to render the settled turn once with its Worklog
   // forced open, then immediately run a second full render only to collapse it.
@@ -15805,7 +16570,20 @@ function _collapseJustSettledWorklogInPlace(streamId){
   const group=Array.from(inner.querySelectorAll('[data-anchor-settled-scene-owner="1"]'))
     .filter(candidate=>candidate.getAttribute('data-anchor-stream-id')===String(streamId))
     .pop();
-  if(!group) return false;
+  if(!group){
+    // #7677: no settled-scene owner group means either a non-transparent miss
+    // (keep the old fail-closed fallback) or a TRANSPARENT stream, which never
+    // stamps that group at all — in which case the second STREAM_DONE render is
+    // redundant exactly when the armed settle render already matches the unarmed
+    // one. Non-transparent callers still get false from the helper below.
+    const redundant=_transparentSettledTurnSecondRenderIsRedundant(streamId);
+    // #7677 (review P2): skipping the unarmed rebuild also skips the cache write
+    // that rebuild used to perform (the armed render is deliberately uncached,
+    // #5260) — snapshot the already-settled DOM so a later switch-away/switch-back
+    // still hits _sessionHtmlCache instead of a full rebuild.
+    if(redundant&&typeof _cacheSettledTranscriptHtml==='function') _cacheSettledTranscriptHtml();
+    return redundant;
+  }
   const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
   const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);
   if(ownerHasVisibleSegment===null) return false;
@@ -16967,6 +17745,7 @@ function clearMessageRenderCache(){
   _clearRenderCache();
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
+  _settleKeepOpenCacheStash=null;
   clearVisibleMessageRowCache();
   _clearMessageVirtualHeightCache();
 }
@@ -18600,8 +19379,13 @@ function renderMessages(options){
   // distinct turns into one run (duplicate final-answer in Worklog/Thinking,
   // or later-turn prose used as an echo-strip input). Turn context must
   // always be complete — never cut mid-run, never head+tail with a gap.
-  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
-  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
+  // #7882 (gate round-7 CORE): the maps also split runs at HIDDEN user-row
+  // boundaries (delegation wakeups) — a hidden wakeup between two answers
+  // still separates the turns. The boundary map derives turn ownership from
+  // the RAW messages via _rawTurnBoundaryByRawIdx().
+  const _turnBoundaryMap=_rawTurnBoundaryByRawIdx(S.messages);
+  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx,_turnBoundaryMap);
+  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx,_turnBoundaryMap);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
@@ -18686,9 +19470,11 @@ function renderMessages(options){
   // body is empty) against the answer prose carried by a SIBLING message in the
   // same turn. A turn = the run of assistant messages between two user messages.
   // Map every assistant rawIdx in a run to the run's combined visible text.
+  // #7882 (gate round-7 CORE): runs also split at HIDDEN user-row boundaries
+  // (delegation wakeups) — see _rawTurnBoundaryByRawIdx.
   const _turnVisibleTextByRawIdx=new Map();
   {
-    let _run=[]; let _runText=[];
+    let _run=[]; let _runText=[]; let _runTurnId;
     const _flush=()=>{
       if(_run.length){
         const combined=_runText.join('\n\n');
@@ -18698,10 +19484,23 @@ function renderMessages(options){
     };
     for(const entry of renderVisWithIdx){
       const em=entry&&entry.m; const role=em&&em.role;
-      if(role==='assistant'){
+      const _turnId=_turnBoundaryMap.get(entry.rawIdx);
+      if(role==='assistant'&&(_run.length===0||_turnId===_runTurnId)){
+        if(_run.length===0) _runTurnId=_turnId;
         _run.push(entry.rawIdx);
         // Visible prose = content with any leading <think>…</think> /channel-thought
         // block stripped (the same blocks the per-message extractor removes below).
+        let vis=typeof em.content==='string'?em.content:'';
+        vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
+               .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
+               .replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trim();
+        if(vis) _runText.push(vis);
+      }else if(role==='assistant'&&_run.length){
+        // #7882 (gate round-7 CORE): the entry that triggered the boundary
+        // flush STARTS the next run (a split, not a drop).
+        _flush();
+        _runTurnId=_turnId;
+        _run.push(entry.rawIdx);
         let vis=typeof em.content==='string'?em.content:'';
         vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
                .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
@@ -18842,6 +19641,21 @@ function renderMessages(options){
     }
     const isProcessWakeup=m&&m._source==='process_wakeup';
     const isUser=m.role==='user';
+    // #7882 (gate round-7 CORE): a hidden delegation_wakeup row between two
+    // answers deletes the user-turn boundary from the visible projection —
+    // without this check both answers render into ONE .assistant-turn
+    // container and installing the follow-up's Worklog hides the parent's
+    // answer segment. Split the container wherever the RAW turn owner
+    // changes, so a hidden row still acts as a turn boundary. Visible user
+    // rows reset below anyway (isUser branch); compaction/recovery rows and
+    // preserved task lists never bump the boundary map, matching their
+    // skip-without-reset behavior here.
+    if(currentAssistantTurn&&vi>0){
+      const prevEntry=renderVisWithIdx[vi-1];
+      if(prevEntry&&_turnBoundaryMap.get(prevEntry.rawIdx)!==_turnBoundaryMap.get(rawIdx)){
+        currentAssistantTurn=null;
+      }
+    }
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
@@ -18899,7 +19713,7 @@ function renderMessages(options){
     const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
       ? _isBranchableReadOnlySession(S.session)
       : false;
-    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1},this)">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -19767,7 +20581,15 @@ function renderMessages(options){
         failover.textContent=failoverText;
         fragments.push(failover);
       }
-      if(gatewayText){
+      // The transparent turn footer owns the model label (.lf-model) whenever
+      // the turn has transparent event rows; skip the generic chip and gateway
+      // label there so exactly one model label renders per turn. Model sits after
+      // duration to match the transparent footer order (elapsed, model, ...).
+      const _transparentFooterOwnsModel=(usedModelText||gatewayText)&&isTransparentStream()&&row&&(()=>{
+        const blocks=_assistantTurnBlocks(row);
+        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
+      })();
+      if(gatewayText&&!_transparentFooterOwnsModel){
         const gateway=document.createElement('span');
         gateway.className='msg-gateway-inline';
         gateway.textContent=gatewayText;
@@ -19779,14 +20601,6 @@ function renderMessages(options){
         duration.textContent=`Done in ${durationText}`;
         fragments.push(duration);
       }
-      // The transparent turn footer owns the model label (.lf-model) whenever
-      // the turn has transparent event rows — skip the generic chip there so
-      // exactly one model label renders per turn. Model sits after duration to
-      // match the transparent footer order (elapsed · model · …).
-      const _transparentFooterOwnsModel=usedModelText&&isTransparentStream()&&row&&(()=>{
-        const blocks=_assistantTurnBlocks(row);
-        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
-      })();
       if(usedModelText&&!_transparentFooterOwnsModel){
         const usedModel=document.createElement('span');
         usedModel.className='msg-used-model-inline';
@@ -19844,9 +20658,8 @@ function renderMessages(options){
       _applyTransparentRowFading(turn);
       if(hasTransparentRows){
         // Read turn metadata from the final metadata-bearing assistant segment,
-        // not querySelector's first match — a tool turn's activity segment
-        // precedes the answer, and the metadata lives on the last message
-        // (#6068 gate round 2: multi-segment turns lost the model label).
+        // not querySelector's first match: a tool turn's activity segment
+        // precedes the answer, and the metadata lives on the last message.
         const msg=_transparentTurnMetaMessage(turn);
         let durationText='';
         let modelText='';
@@ -19856,6 +20669,10 @@ function renderMessages(options){
         if(msg){
           if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
           modelText=_usedModelTurnChipLabel(msg);
+          const routing=msg._gatewayRouting;
+          if(routing&&typeof _formatGatewayModelLabel==='function'){
+            modelText=_formatGatewayModelLabel(String(msg._usedModel||'').trim()||(S.session&&S.session.model)||'', '', routing)||modelText;
+          }
           if(modelText) modelTitle=String(msg._usedModel||'').trim();
           if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
           if(msg._turnUsage){
@@ -20107,6 +20924,26 @@ function renderMessages(options){
       _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
+    // #7677: an unarmed render supersedes any pending settle stash.
+    _settleKeepOpenCacheStash=null;
+  }else if(sid&&_keepOpenArmed){
+    // #7677: still no cache WRITE here (#5260 — the forced-open DOM must never be
+    // persisted), but stash the pre-init snapshot this render already computed.
+    // `cacheHtml` is taken BEFORE highlightCode/addCopyButtons/initTreeViews run,
+    // so it is exactly what the normal cache path would have stored. When the
+    // settle chain then skips the unarmed rebuild, _cacheSettledTranscriptHtml()
+    // publishes this stash — reading it back from the live DOM instead would save
+    // copy buttons and JSON/YAML trees WITHOUT their onclick handlers, leaving
+    // dead controls after a session switch (#7677 review r2 P1).
+    _settleKeepOpenCacheStash=(cacheHtml&&cacheHtml.length<300_000)
+      ? {
+        sid,
+        msgCount,
+        renderWindowKey,
+        html:cacheHtml,
+        signature:cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature,
+      }
+      : null;
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
@@ -21167,7 +22004,7 @@ function editMessage(btn) {
   if(S.busy) return;
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
-  const msgIdx = parseInt(row.dataset.msgIdx, 10);
+  let msgIdx = parseInt(row.dataset.msgIdx, 10);
   const originalText = row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
@@ -21191,6 +22028,9 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-send').onclick = async () => {
     const newText = ta.value.trim();
     if(!newText) return;
+    // Re-read the row's index at send time: history can load (e.g. the outline
+    // opening) after the edit opened, which re-bases data-msg-idx (#2184).
+    if(typeof _rowCurrentRawIdx==='function') msgIdx = _rowCurrentRawIdx(row, msgIdx);
     await submitEdit(msgIdx, newText);
   };
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
@@ -21279,7 +22119,8 @@ async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
   const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
   if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const clickedRowIdx=parseInt(row.dataset.msgIdx,10);
+  const clickedAbsoluteIndex=_oldestIdx+(typeof _rowCurrentRawIdx==='function'?_rowCurrentRawIdx(row,clickedRowIdx):clickedRowIdx);
   const initialSid = S.session.session_id;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
@@ -23522,10 +24363,39 @@ function _showUploadTooLarge(file){
   if(typeof setStatus==='function')setStatus(`\u274c ${message}`);
   else if(typeof showToast==='function')showToast(message,5000,'error');
 }
+// Mobile camera/photo pickers (iOS Safari in particular) hand every photo the
+// same generic name ("image.jpg"). Dropping a file just because its name is
+// taken silently loses the second photo. Only skip a true duplicate (same
+// name, size and mtime); otherwise keep the file under a collision-free name.
+function _pendingFileUniqueName(name){
+  const taken=new Set((S.pendingFiles||[]).map(p=>p&&p.name));
+  if(!taken.has(name))return name;
+  // Keep compound archive extensions whole (.tar.gz etc.) so the renamed copy
+  // still matches _ARCHIVE_EXTS and is extracted rather than uploaded as-is.
+  const compound=/\.tar\.(gz|bz2|xz)$/i.exec(name);
+  const dot=compound?compound.index:name.lastIndexOf('.');
+  const stem=dot>0?name.slice(0,dot):name;
+  const ext=dot>0?name.slice(dot):'';
+  for(let i=2;;i++){
+    const candidate=`${stem}-${i}${ext}`;
+    if(!taken.has(candidate))return candidate;
+  }
+}
+// A pending file's identity is its ORIGINAL name (before any collision rename).
+function _pendingFileOrigName(p){return (p&&p._origName)||(p&&p.name);}
 function addFiles(files){
   for(const f of files){
     if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
-    if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);
+    // True duplicate: same original name, size and mtime as ANY pending file,
+    // including one already renamed to a collision-free alias.
+    if(S.pendingFiles.some(p=>_pendingFileOrigName(p)===f.name&&p.size===f.size&&p.lastModified===f.lastModified))continue;
+    if(S.pendingFiles.some(p=>p.name===f.name)){
+      const copy=new File([f],_pendingFileUniqueName(f.name),{type:f.type,lastModified:f.lastModified});
+      try{Object.defineProperty(copy,'_origName',{value:f.name});}catch(_){}
+      S.pendingFiles.push(copy);
+      continue;
+    }
+    S.pendingFiles.push(f);
   }
   renderTray();
 }
