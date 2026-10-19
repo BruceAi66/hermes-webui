@@ -7,7 +7,9 @@ WEBUI_DIR="/root/hermes-webui"
 BRANCH="master"
 REMOTE="origin"        # 上游 nesquena/hermes-webui
 # 语法门用的解释器:必须 ≥3.10(代码含 `X | None` 标注),系统 python3 是 3.6
-PYBIN="/usr/local/lib/hermes-agent/venv/bin/python3.11"
+# 2026-10-20:旧路径 /usr/local/lib/hermes-agent/venv(python3.11)已随 PM 迁移下线,
+# 首选 WebUI 自己的 venv(3.11,与服务同解释器),再退到 store/系统 python。
+PYBIN="/root/hermes-webui/.venv/bin/python3"
 [[ -x "$PYBIN" ]] || PYBIN="$(command -v python3)"
 DRY=""
 if [[ "${1:-}" == "--dry-run" ]]; then DRY="--dry-run"; fi
