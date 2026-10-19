@@ -1690,8 +1690,19 @@ function _steerIndicatorText(originalMsg, filesSnapshot){
 }
 
 async function _steerPersistDraftForOwner(ownerSid, originalMsg, explicitSteer, filesSnapshot){
-  if(!ownerSid||typeof _saveComposerDraftNow!=='function')return;
-  await _saveComposerDraftNow(ownerSid,_steerRestoreText(originalMsg,explicitSteer),filesSnapshot);
+  if(!ownerSid||typeof _saveComposerDraftNow!=='function') return false;
+  const persistedText = _steerRestoreText(originalMsg,explicitSteer);
+  const persistedFiles = Array.isArray(filesSnapshot) ? [...filesSnapshot] : [];
+  try{
+    const result = _saveComposerDraftNow(ownerSid,persistedText,persistedFiles);
+    if(result&&typeof result.catch==='function'){
+      return result.catch((error)=>_handleComposerDraftPostFailure(error,ownerSid,persistedText,persistedFiles));
+    }
+    return result;
+  }catch(error){
+    _handleComposerDraftPostFailure(error,ownerSid,persistedText,persistedFiles);
+    return false;
+  }
 }
 
 // #5459 gate: cache successful steer uploads by owner session so a failed-steer
@@ -1989,7 +2000,7 @@ function _statusCardFromSession(s){
     {label:t('status_started'), value:_formatStatusTimestamp(s.created_at)},
     {label:t('status_updated'), value:_formatStatusTimestamp(s.updated_at||s.last_message_at)},
     {label:t('status_tokens'), value:_formatStatusTokens(s)},
-    {label:t('status_messages'), value:String(s.message_count??(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool').length)},
+    {label:t('status_messages'), value:String((typeof s.visible_message_count==='number'&&s.visible_message_count>=0)?s.visible_message_count:(s.message_count??(S.messages||[]).filter(m=>m&&m.role&&m.role!=='tool'&&m._source!=='delegation_wakeup').length))},
     {label:t('status_agent_running'), value:running?t('status_yes'):t('status_no')},
   ];
   return {
@@ -2168,8 +2179,13 @@ async function cmdBranch(args){
 // from the beginning of the full transcript.  We capture the absolute
 // count (_oldestIdx + msgIdx) BEFORE awaiting _ensureAllMessagesLoaded,
 // which resets _oldestIdx to 0 after its wholesale replace.  See #2184.
-async function forkFromMessage(msgIdx){
+async function forkFromMessage(msgIdx, btn){
   if(!S.session)return;
+  // The button bakes its 1-based index at render time; re-read it from the row,
+  // since loading full history (e.g. the outline) re-bases indices without a
+  // re-render (#2184).
+  const forkRow=btn&&btn.closest?btn.closest('[data-msg-idx]'):null;
+  if(forkRow&&typeof _rowCurrentRawIdx==='function') msgIdx=_rowCurrentRawIdx(forkRow,msgIdx-1)+1;
   // During streaming, only block fork if the clicked message is the
   // currently-streaming (live) message itself.  Past messages that are
   // already committed server-side can be forked immediately without
@@ -2313,12 +2329,30 @@ async function getBundleCommandMetadata(name){
   const bundles=await loadBundleCommands();
   return bundles.find(bundle=>String(bundle&&bundle.name||'').toLowerCase()===needle)||null;
 }
+// The composer text the user last closed the list on, by picking a command or pressing
+// Escape. A refresh that was not caused by typing (a slash-command loader landing late,
+// or a lookup still in flight) must not re-open the list for that same text; any edit
+// clears it. Without this, a failing /api/skills (agent-free server) is retried on every
+// keystroke and its late refresh re-opened the list after `/new` was taken, so the next
+// Enter picked again instead of sending (#8050). Closing because nothing matched is not
+// a dismissal: a loader that lands later may still have matches to show.
+let _slashDismissedText=null;
+function markSlashDropdownDismissed(){
+  const ta=$('msg');
+  _slashDismissedText=ta?String(ta.value||''):null;
+}
+function clearSlashDropdownDismissed(){ _slashDismissedText=null; }
+function slashDropdownDismissedFor(text){
+  return _slashDismissedText!==null&&_slashDismissedText===String(text||'');
+}
 function refreshSlashCommandDropdown(){
   const ta=$('msg');if(!ta)return;
   const text=ta.value||'';
   if(text.indexOf('\n')!==-1||_activeSlashCommandOffset(text)<0){hideCmdDropdown();return;}
+  if(slashDropdownDismissedFor(text)) return;
   getSlashAutocompleteMatches(text).then(matches=>{
     if(($('msg').value||'')!==text) return;
+    if(slashDropdownDismissedFor(text)) return;
     if(matches.length)showCmdDropdown(matches);else hideCmdDropdown();
   });
 }
@@ -2401,6 +2435,7 @@ function showCmdDropdown(matches){
         });
       }else{
         hideCmdDropdown();
+        markSlashDropdownDismissed();
       }
     };
     dd.appendChild(el);
@@ -2437,6 +2472,10 @@ function selectCmdDropdownItem(){
     items[_cmdSelectedIdx].onmousedown({preventDefault:()=>{}});
   } else if(items.length===1){
     items[0].onmousedown({preventDefault:()=>{}});
+  } else {
+    hideCmdDropdown();
+    markSlashDropdownDismissed();
+    return;
   }
   hideCmdDropdown();
 }
